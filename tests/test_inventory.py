@@ -120,8 +120,31 @@ def test_layout_detection_movie_folder(tmp_path: Path) -> None:
     assert detect_layout("movies", relative) == Layout.MOVIE_FOLDER
 
 
+def test_layout_detection_movie_collection_folder(tmp_path: Path) -> None:
+    relative = Path("Star Wars/A New Hope/A New Hope_001.mp4")
+    assert detect_layout("movies", relative) == Layout.MOVIE_COLLECTION_FOLDER
+
+
+def test_collection_folder_with_multiple_files_is_untouched_by_scan(tmp_path: Path) -> None:
+    movie_dir = tmp_path / "Star Wars" / "The Phantom Menace"
+    disc_one = movie_dir / "The Phantom Menace_001.mkv"
+    disc_two = movie_dir / "The Phantom Menace_002.mkv"
+    _touch(disc_one, size=11)
+    _touch(disc_two, size=22)
+    before = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in (disc_one, disc_two)}
+
+    scan = scan_category("movies", tmp_path)
+
+    assert scan.file_count == 2
+    layouts = {f.filename: f.layout for f in scan.files}
+    assert layouts["The Phantom Menace_001.mkv"] == Layout.MOVIE_COLLECTION_FOLDER
+    assert layouts["The Phantom Menace_002.mkv"] == Layout.MOVIE_COLLECTION_FOLDER
+    after = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in (disc_one, disc_two)}
+    assert before == after
+
+
 def test_layout_detection_movie_unknown_when_deeply_nested(tmp_path: Path) -> None:
-    relative = Path("Movie (2001)/Extras/Movie (2001).mkv")
+    relative = Path("Star Wars/A New Hope/Extras/A New Hope_001.mp4")
     assert detect_layout("movies", relative) == Layout.UNKNOWN
 
 
@@ -143,12 +166,16 @@ def test_layout_detection_tv_unknown_when_deeply_nested(tmp_path: Path) -> None:
 def test_layout_detection_end_to_end_scan(tmp_path: Path) -> None:
     _touch(tmp_path / "Flat Movie (2001).mkv")
     _touch(tmp_path / "Folder Movie (2002)/Folder Movie (2002).mkv")
+    _touch(tmp_path / "Star Wars/A New Hope/A New Hope_001.mp4")
+    _touch(tmp_path / "The Lord of the Rings/Fellowship of the Ring/TheFellowshipOfTheRing.mp4")
 
     scan = scan_category("movies", tmp_path)
     layouts = {f.filename: f.layout for f in scan.files}
 
     assert layouts["Flat Movie (2001).mkv"] == Layout.MOVIE_FLAT
     assert layouts["Folder Movie (2002).mkv"] == Layout.MOVIE_FOLDER
+    assert layouts["A New Hope_001.mp4"] == Layout.MOVIE_COLLECTION_FOLDER
+    assert layouts["TheFellowshipOfTheRing.mp4"] == Layout.MOVIE_COLLECTION_FOLDER
 
 
 def test_missing_directory_does_not_raise(tmp_path: Path) -> None:

@@ -66,6 +66,7 @@ class Layout(StrEnum):
 
     MOVIE_FLAT = "movie_flat"
     MOVIE_FOLDER = "movie_folder"
+    MOVIE_COLLECTION_FOLDER = "movie_collection_folder"
     TV_SERIES_FOLDER = "tv_series_folder"
     TV_SEASON_FOLDER = "tv_season_folder"
     UNKNOWN = "unknown"
@@ -165,7 +166,9 @@ def detect_layout(category: str, relative_path: Path) -> Layout:
     """Classify how a discovered file is organized relative to its category root.
 
     Movie-style categories: depth 1 (file directly under root) is a flat
-    file; depth 2 (one containing folder) is a folder-per-movie.
+    file; depth 2 (one containing folder) is a folder-per-movie; depth 3
+    (a collection/franchise folder containing a per-movie folder, e.g.
+    `Star Wars/A New Hope/A New Hope_001.mp4`) is a collection folder.
 
     TV-style categories: depth 2 (series folder only) is a series-folder
     layout; depth 3 (series folder + season folder) is a season-folder
@@ -180,6 +183,8 @@ def detect_layout(category: str, relative_path: Path) -> Layout:
             return Layout.MOVIE_FLAT
         if depth == 2:
             return Layout.MOVIE_FOLDER
+        if depth == 3:
+            return Layout.MOVIE_COLLECTION_FOLDER
         return Layout.UNKNOWN
     if category in TV_CATEGORIES:
         if depth == 2:

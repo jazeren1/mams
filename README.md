@@ -63,5 +63,9 @@ Each run writes a JSON report and a human-readable summary under
 `reports/` (default: `reports/library.json` and
 `reports/library-summary.txt`). Each discovered file records its category,
 absolute and relative path, filename, extension, parent directory, size,
-and detected layout (`movie_flat`, `movie_folder`, `tv_series_folder`,
-`tv_season_folder`, or `unknown`).
+and detected layout (`movie_flat`, `movie_folder`, `movie_collection_folder`,
+`tv_series_folder`, `tv_season_folder`, or `unknown`). A movie category file
+two directory levels below its category root — collection/franchise folder,
+then per-movie folder, e.g. `Movies/Star Wars/A New Hope/A New Hope_001.mp4`
+— is reported as `movie_collection_folder`; anything nested deeper remains
+`unknown`.

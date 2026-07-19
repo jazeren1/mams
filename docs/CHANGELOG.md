@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+Added a `movie_collection_folder` layout classification to the inventory
+scanner for movies stored under a collection/franchise grouping folder
+(e.g. `Movies/Star Wars/A New Hope/A New Hope_001.mp4`). Fixes the 52
+movie files a real NAS scan reported as `unknown`. `movie_flat` and
+`movie_folder` detection are unchanged; paths nested deeper than the
+collection pattern still report `unknown`.
+
 ## 0.2.0
 
 Added a read-only library inventory scanner (`mams inventory scan`). Recursively
