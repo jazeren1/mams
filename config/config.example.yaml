@@ -1,0 +1,43 @@
+project:
+  name: "Media Archive Management System"
+  database_path: "./database/mams.db"
+  log_level: "INFO"
+  dry_run: true
+
+staging:
+  incoming: "/Users/CHANGE_ME/Media Archive/Incoming"
+  needs_review: "/Users/CHANGE_ME/Media Archive/Needs Review"
+
+nas:
+  backup_root: "/Volumes/CHANGE_ME/MAMS-Backup"
+  categories:
+    movies: "/Volumes/CHANGE_ME/Movies"
+    kids_movies: "/Volumes/CHANGE_ME/Kids Movies"
+    tv: "/Volumes/CHANGE_ME/TV"
+    kids_shows: "/Volumes/CHANGE_ME/Kids Shows"
+    fitness: "/Volumes/CHANGE_ME/Fitness"
+
+plex:
+  enabled: false
+  base_url: "http://PLEX_SERVER_IP:32400"
+  token_env_var: "PLEX_TOKEN"
+  libraries:
+    movies: "Movies"
+    kids_movies: "Kids Movies"
+    tv: "TV"
+    kids_shows: "Kids Shows"
+    fitness: "Fitness"
+
+naming:
+  movie: "{title} ({year})"
+  episode_with_title: "{series} - S{season:02d}E{episode:02d} - {episode_title}"
+  episode_without_title: "{series} - S{season:02d}E{episode:02d}"
+  season_folder: "Season {season:02d}"
+
+verification:
+  checksum_algorithm: "sha256"
+  require_playback_check: true
+  require_destination_checksum: true
+  movie_min_runtime_minutes: 45
+  episode_min_runtime_minutes: 15
+  episode_max_runtime_minutes: 120
