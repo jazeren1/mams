@@ -13,6 +13,9 @@ class AppConfig:
     @property
     def dry_run(self) -> bool:
         return bool(self.raw["project"].get("dry_run", True))
+    @property
+    def nas_categories(self) -> dict[str, str]:
+        return dict(self.raw.get("nas", {}).get("categories", {}))
 
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)

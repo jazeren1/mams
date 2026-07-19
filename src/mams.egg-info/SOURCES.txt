@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/mams/__init__.py
+src/mams/cli.py
+src/mams/config.py
+src/mams/db.py
+src/mams/models.py
+src/mams.egg-info/PKG-INFO
+src/mams.egg-info/SOURCES.txt
+src/mams.egg-info/dependency_links.txt
+src/mams.egg-info/entry_points.txt
+src/mams.egg-info/requires.txt
+src/mams.egg-info/top_level.txt
+tests/test_smoke.py

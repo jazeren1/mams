@@ -54,3 +54,11 @@ The Dark Knight Rises, Lucky Number Slevin, Carnivàle Season 1 Disc 1, and Dist
 ## Storage outlook
 
 The finished archive is likely to require roughly 11–14 TB depending on TV volume and future upgrades. Compression is not part of the archive-master strategy.
+
+## Implemented tooling
+
+- `mams inventory scan`: a read-only scanner that recursively discovers
+  media files under the NAS category paths in `config/config.yaml`,
+  detects flat/folder-per-movie and series/season TV layouts, and writes a
+  JSON report and a human-readable summary under `reports/`. It never
+  renames, moves, deletes, checksums, or otherwise modifies scanned media.

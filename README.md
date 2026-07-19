@@ -44,3 +44,24 @@ Music exists on the NAS but is out of scope for the first version.
 5. Update NAS paths and Plex library names.
 6. Initialize the database using `python scripts/init_db.py`.
 7. Begin with manual logging before enabling any file-moving automation.
+
+## Inventory scanner
+
+`mams inventory scan` is a read-only scanner that recursively discovers
+media files under the NAS category paths configured in `config/config.yaml`
+(Movies, Kids Movies, TV, Kids Shows, Fitness). It never renames, moves,
+deletes, checksums, or otherwise modifies scanned media — it only reads
+directory entries and file sizes.
+
+```text
+mams inventory scan
+mams inventory scan --json
+mams inventory scan --output reports/library.json
+```
+
+Each run writes a JSON report and a human-readable summary under
+`reports/` (default: `reports/library.json` and
+`reports/library-summary.txt`). Each discovered file records its category,
+absolute and relative path, filename, extension, parent directory, size,
+and detected layout (`movie_flat`, `movie_folder`, `tv_series_folder`,
+`tv_season_folder`, or `unknown`).
