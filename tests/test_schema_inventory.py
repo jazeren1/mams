@@ -25,10 +25,26 @@ INVENTORY_TABLES = {
 }
 
 
+def _migrations_dir_through(tmp_path: Path, *versions: str) -> Path:
+    """A temp migrations dir containing only the named repo migration files.
+
+    Scopes this file's tests to exactly the migrations it's testing (0001,
+    0002), so a later migration (0003+) added elsewhere never changes the
+    schema_version this file expects.
+    """
+    scoped = tmp_path / "scoped_migrations"
+    scoped.mkdir(exist_ok=True)
+    for version in versions:
+        matches = list(REPO_MIGRATIONS_DIR.glob(f"{version}_*.sql"))
+        assert len(matches) == 1, f"expected exactly one migration file for {version}"
+        (scoped / matches[0].name).write_text(matches[0].read_text(encoding="utf-8"), encoding="utf-8")
+    return scoped
+
+
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
     path = tmp_path / "mams.db"
-    migrate(path, REPO_MIGRATIONS_DIR)
+    migrate(path, _migrations_dir_through(tmp_path, "0001", "0002"))
     return path
 
 
@@ -262,8 +278,9 @@ def test_required_index_exists(db_path: Path, index_name: str) -> None:
 
 def test_migrate_from_version_1_to_2_is_idempotent_on_rerun(tmp_path: Path) -> None:
     path = tmp_path / "mams.db"
-    first = migrate(path, REPO_MIGRATIONS_DIR)
-    second = migrate(path, REPO_MIGRATIONS_DIR)
+    migrations_dir = _migrations_dir_through(tmp_path, "0001", "0002")
+    first = migrate(path, migrations_dir)
+    second = migrate(path, migrations_dir)
 
     assert first == [1, 2]
     assert second == []
