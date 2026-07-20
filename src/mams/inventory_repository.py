@@ -44,6 +44,7 @@ never one query per file — and never re-walks the filesystem.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .inventory import CategoryScan, InventoryReport, Layout, ScannedFile
@@ -526,3 +527,327 @@ def read_inventory_report(connection: sqlite3.Connection, categories: dict[str, 
         )
 
     return InventoryReport(categories=tuple(category_scans))
+
+
+# --- query layer (list / stats / search) ------------------------------------
+#
+# Distinct from read_inventory_report() above: these return flat, lightweight
+# records for browsing/filtering (mams inventory list/stats/find), not the
+# fully reconstructed nested MediaInfo domain model. Every function here
+# runs a fixed, small number of queries regardless of how many media_files
+# rows match — never one query per row.
+
+
+@dataclass(frozen=True)
+class MediaFileRecord:
+    """One media_files row, flattened with its category and track counts."""
+
+    id: int
+    category: str
+    absolute_path: str
+    relative_path: str
+    filename: str
+    extension: str
+    parent_directory: str
+    layout: str
+    size_bytes: int
+    mtime: float | None
+    state: str
+    container: str | None
+    duration_seconds: float | None
+    overall_bitrate: int | None
+    media_info_error: str | None
+    media_info_probed_at: str | None
+    video_track_count: int
+    audio_track_count: int
+    subtitle_track_count: int
+    first_seen_scan_id: int
+    last_seen_scan_id: int
+    missing_since_scan_id: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LibraryStats:
+    category: str
+    root_path: str
+    active_count: int
+    missing_count: int
+    active_total_size_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RecentScanSummary:
+    id: int
+    status: str
+    started_at: str
+    completed_at: str | None
+    metadata_enabled: bool
+    mediainfo_version: str | None
+    file_count: int | None
+    total_size_bytes: int | None
+    added_count: int | None
+    updated_count: int | None
+    missing_count: int | None
+    restored_count: int | None
+    error_message: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class InventoryStats:
+    libraries: tuple[LibraryStats, ...]
+    active_file_count: int
+    missing_file_count: int
+    active_total_size_bytes: int
+    layout_counts: dict[str, int]
+    extension_counts: dict[str, int]
+    metadata_success_count: int
+    metadata_error_count: int
+    metadata_not_probed_count: int
+    video_track_count: int
+    audio_track_count: int
+    subtitle_track_count: int
+    most_recent_scan: RecentScanSummary | None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+_MEDIA_FILE_BASE_SELECT = """
+    SELECT
+        media_files.*,
+        libraries.category AS category,
+        (SELECT COUNT(*) FROM video_tracks WHERE video_tracks.media_file_id = media_files.id)
+            AS video_track_count,
+        (SELECT COUNT(*) FROM audio_tracks WHERE audio_tracks.media_file_id = media_files.id)
+            AS audio_track_count,
+        (SELECT COUNT(*) FROM subtitle_tracks WHERE subtitle_tracks.media_file_id = media_files.id)
+            AS subtitle_track_count
+    FROM media_files
+    JOIN libraries ON libraries.id = media_files.library_id
+"""
+
+
+def _row_to_media_file_record(row: sqlite3.Row) -> MediaFileRecord:
+    return MediaFileRecord(
+        id=row["id"],
+        category=row["category"],
+        absolute_path=row["absolute_path"],
+        relative_path=row["relative_path"],
+        filename=row["filename"],
+        extension=row["extension"],
+        parent_directory=row["parent_directory"],
+        layout=row["layout"],
+        size_bytes=row["size_bytes"],
+        mtime=row["mtime"],
+        state=row["state"],
+        container=row["container"],
+        duration_seconds=row["duration_seconds"],
+        overall_bitrate=row["overall_bitrate"],
+        media_info_error=row["media_info_error"],
+        media_info_probed_at=row["media_info_probed_at"],
+        video_track_count=row["video_track_count"],
+        audio_track_count=row["audio_track_count"],
+        subtitle_track_count=row["subtitle_track_count"],
+        first_seen_scan_id=row["first_seen_scan_id"],
+        last_seen_scan_id=row["last_seen_scan_id"],
+        missing_since_scan_id=row["missing_since_scan_id"],
+    )
+
+
+def list_media_files(
+    connection: sqlite3.Connection,
+    *,
+    category: str | None = None,
+    state: str | None = None,
+    layout: str | None = None,
+    metadata_error: bool | None = None,
+    limit: int | None = None,
+) -> list[MediaFileRecord]:
+    """List media_files rows for browsing, with deterministic ordering.
+
+    All filters are optional and combined with AND. `metadata_error=True`
+    restricts to rows with a recorded probe error; `metadata_error=False`
+    restricts to rows without one; `None` (default) applies no filter.
+    Ordered by (category, relative_path, id) — stable regardless of
+    insertion order.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if category is not None:
+        clauses.append("libraries.category = ?")
+        params.append(category)
+    if state is not None:
+        clauses.append("media_files.state = ?")
+        params.append(state)
+    if layout is not None:
+        clauses.append("media_files.layout = ?")
+        params.append(layout)
+    if metadata_error is True:
+        clauses.append("media_files.media_info_error IS NOT NULL")
+    elif metadata_error is False:
+        clauses.append("media_files.media_info_error IS NULL")
+
+    sql = _MEDIA_FILE_BASE_SELECT
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY libraries.category, media_files.relative_path, media_files.id"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    rows = connection.execute(sql, params).fetchall()
+    return [_row_to_media_file_record(row) for row in rows]
+
+
+def search_media_files(
+    connection: sqlite3.Connection,
+    query: str,
+    *,
+    category: str | None = None,
+    state: str | None = None,
+    limit: int | None = None,
+) -> list[MediaFileRecord]:
+    """Case-insensitive substring search over filename/relative_path/absolute_path.
+
+    Parameterized throughout — `query` is never interpolated into the SQL
+    text. Case-insensitivity relies on SQLite's built-in `LOWER()`, which is
+    ASCII-only without a loaded extension; non-ASCII characters (e.g. an
+    accented title) won't case-fold, though they still match as typed.
+    Ordered the same deterministic way as `list_media_files`.
+    """
+    pattern = f"%{query.lower()}%"
+    clauses = [
+        "(LOWER(media_files.filename) LIKE ? "
+        "OR LOWER(media_files.relative_path) LIKE ? "
+        "OR LOWER(media_files.absolute_path) LIKE ?)"
+    ]
+    params: list[object] = [pattern, pattern, pattern]
+    if category is not None:
+        clauses.append("libraries.category = ?")
+        params.append(category)
+    if state is not None:
+        clauses.append("media_files.state = ?")
+        params.append(state)
+
+    sql = _MEDIA_FILE_BASE_SELECT + " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY libraries.category, media_files.relative_path, media_files.id"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    rows = connection.execute(sql, params).fetchall()
+    return [_row_to_media_file_record(row) for row in rows]
+
+
+def _row_to_recent_scan_summary(row: sqlite3.Row) -> RecentScanSummary:
+    return RecentScanSummary(
+        id=row["id"],
+        status=row["status"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        metadata_enabled=bool(row["metadata_enabled"]),
+        mediainfo_version=row["mediainfo_version"],
+        file_count=row["file_count"],
+        total_size_bytes=row["total_size_bytes"],
+        added_count=row["added_count"],
+        updated_count=row["updated_count"],
+        missing_count=row["missing_count"],
+        restored_count=row["restored_count"],
+        error_message=row["error_message"],
+    )
+
+
+def get_inventory_stats(connection: sqlite3.Connection) -> InventoryStats:
+    """Aggregate current-inventory statistics in six fixed queries, none of
+    them per-file: per-library counts/sizes, layout counts, extension
+    counts, metadata success/error/not-probed counts, track counts, and the
+    single most recent scan_runs row (regardless of its status)."""
+    library_rows = connection.execute(
+        """
+        SELECT
+            libraries.category,
+            libraries.root_path,
+            COUNT(CASE WHEN media_files.state = 'ACTIVE' THEN 1 END) AS active_count,
+            COUNT(CASE WHEN media_files.state = 'MISSING' THEN 1 END) AS missing_count,
+            COALESCE(SUM(CASE WHEN media_files.state = 'ACTIVE' THEN media_files.size_bytes END), 0)
+                AS active_total_size_bytes
+        FROM libraries
+        LEFT JOIN media_files ON media_files.library_id = libraries.id
+        GROUP BY libraries.id
+        ORDER BY libraries.category
+        """
+    ).fetchall()
+    libraries = tuple(
+        LibraryStats(
+            category=row["category"],
+            root_path=row["root_path"],
+            active_count=row["active_count"],
+            missing_count=row["missing_count"],
+            active_total_size_bytes=row["active_total_size_bytes"],
+        )
+        for row in library_rows
+    )
+
+    layout_counts = {
+        row["layout"]: row["n"]
+        for row in connection.execute(
+            "SELECT layout, COUNT(*) AS n FROM media_files WHERE state = 'ACTIVE' GROUP BY layout"
+        ).fetchall()
+    }
+    extension_counts = {
+        row["extension"]: row["n"]
+        for row in connection.execute(
+            "SELECT extension, COUNT(*) AS n FROM media_files WHERE state = 'ACTIVE' GROUP BY extension"
+        ).fetchall()
+    }
+
+    metadata_row = connection.execute(
+        """
+        SELECT
+            SUM(CASE WHEN media_info_error IS NOT NULL THEN 1 ELSE 0 END) AS error_count,
+            SUM(CASE WHEN media_info_error IS NULL AND media_info_probed_at IS NOT NULL THEN 1 ELSE 0 END)
+                AS success_count,
+            SUM(CASE WHEN media_info_probed_at IS NULL THEN 1 ELSE 0 END) AS not_probed_count
+        FROM media_files
+        WHERE state = 'ACTIVE'
+        """
+    ).fetchone()
+
+    track_row = connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM video_tracks JOIN media_files ON media_files.id = video_tracks.media_file_id
+                WHERE media_files.state = 'ACTIVE') AS video_count,
+            (SELECT COUNT(*) FROM audio_tracks JOIN media_files ON media_files.id = audio_tracks.media_file_id
+                WHERE media_files.state = 'ACTIVE') AS audio_count,
+            (SELECT COUNT(*) FROM subtitle_tracks JOIN media_files ON media_files.id = subtitle_tracks.media_file_id
+                WHERE media_files.state = 'ACTIVE') AS subtitle_count
+        """
+    ).fetchone()
+
+    scan_row = connection.execute("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1").fetchone()
+
+    return InventoryStats(
+        libraries=libraries,
+        active_file_count=sum(lib.active_count for lib in libraries),
+        missing_file_count=sum(lib.missing_count for lib in libraries),
+        active_total_size_bytes=sum(lib.active_total_size_bytes for lib in libraries),
+        layout_counts=layout_counts,
+        extension_counts=extension_counts,
+        metadata_success_count=metadata_row["success_count"] or 0,
+        metadata_error_count=metadata_row["error_count"] or 0,
+        metadata_not_probed_count=metadata_row["not_probed_count"] or 0,
+        video_track_count=track_row["video_count"],
+        audio_track_count=track_row["audio_count"],
+        subtitle_track_count=track_row["subtitle_count"],
+        most_recent_scan=_row_to_recent_scan_summary(scan_row) if scan_row is not None else None,
+    )
