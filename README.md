@@ -69,3 +69,30 @@ two directory levels below its category root — collection/franchise folder,
 then per-movie folder, e.g. `Movies/Star Wars/A New Hope/A New Hope_001.mp4`
 — is reported as `movie_collection_folder`; anything nested deeper remains
 `unknown`.
+
+## Media metadata (MediaInfo)
+
+`mams inventory scan --metadata` additionally enriches each discovered file
+with technical metadata extracted from the `mediainfo` CLI tool: container
+format, duration, overall bitrate; per video track codec, resolution,
+aspect ratio, frame rate, HDR format, bit depth, and scan type; per audio
+track codec, language, channel count, bitrate, and default flag; and per
+subtitle track language, default flag, and forced flag. This is read-only —
+it only invokes `mediainfo` and reads its JSON output; it never modifies
+scanned media. Without `--metadata`, the scanner behaves exactly as
+before. If `mediainfo` is not installed, or fails on a particular file, the
+error is recorded on that file (`media_info_error`) and the scan continues.
+
+```text
+mams inventory scan --metadata
+```
+
+`mams mediainfo <path>` is a developer diagnostic command that runs the
+same MediaInfo parser against a single file and prints the parsed result,
+without rescanning the whole library. It is read-only and never modifies
+the target file.
+
+```text
+mams mediainfo "/path/to/movie.mkv"
+mams mediainfo "/path/to/movie.mkv" --json
+```

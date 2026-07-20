@@ -10,6 +10,7 @@ from mams.inventory import (
     scan_categories,
     scan_category,
 )
+from mams.mediainfo import MediaInfo, MediaInfoOutcome
 
 
 def _touch(path: Path, size: int = 0) -> None:
@@ -280,3 +281,114 @@ def test_render_summary_reports_counts(tmp_path: Path) -> None:
 
     assert "files: 1" in summary
     assert "Total files: 1" in summary
+
+
+class _FakeMetadataProvider:
+    """Deterministic stand-in for MediaInfoProvider used in inventory tests."""
+
+    def __init__(self) -> None:
+        self.probed_paths: list[Path] = []
+
+    def probe(self, path: Path) -> MediaInfoOutcome:
+        self.probed_paths.append(path)
+        if path.name.startswith("corrupt"):
+            return MediaInfoOutcome(media_info=None, error="corrupt file")
+        info = MediaInfo(
+            container="Matroska",
+            duration_seconds=120.0,
+            overall_bitrate=1000,
+            video_tracks=(),
+            audio_tracks=(),
+            subtitle_tracks=(),
+        )
+        return MediaInfoOutcome(media_info=info, error=None)
+
+
+def test_scan_without_metadata_provider_leaves_media_info_none(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie (2001).mkv")
+
+    scan = scan_category("movies", tmp_path)
+
+    assert scan.files[0].media_info is None
+    assert scan.files[0].media_info_error is None
+
+
+def test_scan_with_metadata_provider_enriches_files(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie (2001).mkv")
+    provider = _FakeMetadataProvider()
+
+    scan = scan_category("movies", tmp_path, metadata_provider=provider)
+
+    assert scan.files[0].media_info is not None
+    assert scan.files[0].media_info.container == "Matroska"
+    assert scan.files[0].media_info_error is None
+
+
+def test_scan_records_metadata_errors_without_stopping(tmp_path: Path) -> None:
+    _touch(tmp_path / "corrupt (2001).mkv")
+    _touch(tmp_path / "good (2002).mkv")
+    provider = _FakeMetadataProvider()
+
+    scan = scan_category("movies", tmp_path, metadata_provider=provider)
+
+    assert scan.file_count == 2
+    by_name = {f.filename: f for f in scan.files}
+    assert by_name["corrupt (2001).mkv"].media_info is None
+    assert by_name["corrupt (2001).mkv"].media_info_error == "corrupt file"
+    assert by_name["good (2002).mkv"].media_info is not None
+    assert by_name["good (2002).mkv"].media_info_error is None
+
+
+def test_scan_probes_each_file_exactly_once(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie One (2001).mkv")
+    _touch(tmp_path / "Movie Two (2002).mkv")
+    provider = _FakeMetadataProvider()
+
+    scan_category("movies", tmp_path, metadata_provider=provider)
+
+    assert len(provider.probed_paths) == 2
+    assert len(set(provider.probed_paths)) == 2
+
+
+def test_scan_categories_passes_metadata_provider_through(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie (2001).mkv")
+    provider = _FakeMetadataProvider()
+
+    report = scan_categories({"movies": str(tmp_path)}, metadata_provider=provider)
+
+    files = report.categories[0].files
+    assert files[0].media_info is not None
+    assert len(provider.probed_paths) == 1
+
+
+def test_json_report_includes_media_info_when_present(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie (2001).mkv")
+    provider = _FakeMetadataProvider()
+
+    report = scan_categories({"movies": str(tmp_path)}, metadata_provider=provider)
+    payload = json.loads(report.to_json())
+
+    file_payload = payload["categories"][0]["files"][0]
+    assert file_payload["media_info"]["container"] == "Matroska"
+    assert file_payload["media_info_error"] is None
+
+
+def test_render_summary_reports_metadata_counts(tmp_path: Path) -> None:
+    _touch(tmp_path / "corrupt (2001).mkv")
+    _touch(tmp_path / "good (2002).mkv")
+    provider = _FakeMetadataProvider()
+
+    report = scan_categories({"movies": str(tmp_path)}, metadata_provider=provider)
+    summary = render_summary(report)
+
+    assert "metadata extracted: 1" in summary
+    assert "metadata errors:    1" in summary
+
+
+def test_render_summary_omits_metadata_lines_when_not_requested(tmp_path: Path) -> None:
+    _touch(tmp_path / "Movie (2001).mkv")
+
+    report = scan_categories({"movies": str(tmp_path)})
+    summary = render_summary(report)
+
+    assert "metadata extracted" not in summary

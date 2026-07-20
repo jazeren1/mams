@@ -62,3 +62,12 @@ The finished archive is likely to require roughly 11–14 TB depending on TV vol
   detects flat/folder-per-movie and series/season TV layouts, and writes a
   JSON report and a human-readable summary under `reports/`. It never
   renames, moves, deletes, checksums, or otherwise modifies scanned media.
+- `mams inventory scan --metadata`: optionally enriches each discovered
+  file with technical metadata (container, duration, bitrate, video/audio/
+  subtitle track detail, HDR format) via a MediaInfo provider abstraction
+  (`src/mams/mediainfo.py`). Read-only: it only invokes the `mediainfo`
+  CLI tool and reads its JSON output. A missing executable or a failure on
+  one file is recorded on that file and never stops the scan.
+- `mams mediainfo <path>`: a developer diagnostic command that runs the
+  same MediaInfo parser against a single file, for debugging without
+  rescanning the whole library. Read-only.

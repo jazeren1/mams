@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Iterator
 
+from .mediainfo import MediaInfo, MetadataProvider
+
 # Extensions considered playable media. Comparison is case-insensitive.
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -84,6 +86,8 @@ class ScannedFile:
     parent_directory: str
     size_bytes: int
     layout: Layout
+    media_info: MediaInfo | None = None
+    media_info_error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -211,12 +215,22 @@ def _walk(root: Path) -> Iterator[Path]:
             yield entry
 
 
-def scan_category(category: str, root: str | Path) -> CategoryScan:
+def scan_category(
+    category: str,
+    root: str | Path,
+    *,
+    metadata_provider: MetadataProvider | None = None,
+) -> CategoryScan:
     """Recursively scan a single category root for supported media files.
 
     Never raises for a missing directory; returns a `CategoryScan` with
     `exists=False` and no files instead, so callers can report incomplete
     configuration without aborting the whole scan.
+
+    When `metadata_provider` is given, each discovered file is probed
+    through it exactly once. A probe failure (missing executable, corrupt
+    file, malformed output) is recorded on the `ScannedFile` and never
+    stops the scan.
     """
     root_path = Path(root)
     if not root_path.is_dir():
@@ -231,6 +245,14 @@ def scan_category(category: str, root: str | Path) -> CategoryScan:
             continue
         relative = path.relative_to(root_path)
         size_bytes = path.stat().st_size
+
+        media_info: MediaInfo | None = None
+        media_info_error: str | None = None
+        if metadata_provider is not None:
+            outcome = metadata_provider.probe(path)
+            media_info = outcome.media_info
+            media_info_error = outcome.error
+
         discovered.append(
             ScannedFile(
                 category=category,
@@ -241,6 +263,8 @@ def scan_category(category: str, root: str | Path) -> CategoryScan:
                 parent_directory=str(path.parent),
                 size_bytes=size_bytes,
                 layout=detect_layout(category, relative),
+                media_info=media_info,
+                media_info_error=media_info_error,
             )
         )
 
@@ -249,13 +273,20 @@ def scan_category(category: str, root: str | Path) -> CategoryScan:
     return CategoryScan(category=category, root_path=str(root_path), exists=True, files=tuple(discovered))
 
 
-def scan_categories(categories: dict[str, str]) -> InventoryReport:
+def scan_categories(
+    categories: dict[str, str],
+    *,
+    metadata_provider: MetadataProvider | None = None,
+) -> InventoryReport:
     """Scan every configured category and return an aggregate report.
 
     Categories are scanned in the order given (dict insertion order), which
     matches the order categories appear in `config.yaml`.
     """
-    scans = tuple(scan_category(category, root) for category, root in categories.items())
+    scans = tuple(
+        scan_category(category, root, metadata_provider=metadata_provider)
+        for category, root in categories.items()
+    )
     return InventoryReport(categories=scans)
 
 
@@ -285,6 +316,12 @@ def render_summary(report: InventoryReport) -> str:
             layout_counts[f.layout.value] = layout_counts.get(f.layout.value, 0) + 1
         for layout_name in sorted(layout_counts):
             lines.append(f"    {layout_name}: {layout_counts[layout_name]}")
+        probed = [f for f in cat.files if f.media_info is not None or f.media_info_error is not None]
+        if probed:
+            succeeded = sum(1 for f in probed if f.media_info is not None)
+            failed = sum(1 for f in probed if f.media_info_error is not None)
+            lines.append(f"  metadata extracted: {succeeded}")
+            lines.append(f"  metadata errors:    {failed}")
     lines.append("")
     lines.append(f"Total files: {report.file_count}")
     lines.append(f"Total size:  {_human_size(report.total_size_bytes)}")
