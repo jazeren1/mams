@@ -1,7 +1,7 @@
 from pathlib import Path
 import shutil
 from mams.config import load_config
-from mams.db import initialize
+from mams.db import DEFAULT_MIGRATIONS_DIR, migrate
 
 def main() -> None:
     config_path = Path("config/config.yaml")
@@ -11,8 +11,11 @@ def main() -> None:
         print("Created config/config.yaml from the example.")
         print("Edit the paths before using file-moving automation.")
     config = load_config(config_path)
-    initialize(config.database_path, Path("database/schema.sql"))
-    print(f"Initialized database at {config.database_path}")
+    applied = migrate(config.database_path, Path(DEFAULT_MIGRATIONS_DIR))
+    if applied:
+        print(f"Applied migrations {applied} to {config.database_path}")
+    else:
+        print(f"Database already up to date at {config.database_path}")
 
 if __name__ == "__main__":
     main()
