@@ -171,6 +171,38 @@ class MediaInfoProvider:
 
         return MediaInfoOutcome(media_info=media_info, error=None)
 
+    def get_version(self) -> str | None:
+        """Return the `mediainfo` CLI's reported version string, or None if
+        unavailable (missing executable, non-zero exit, or a timeout).
+
+        Read-only: runs `mediainfo --Version` once. Reuses `probe()`'s
+        temp-file stdout capture — see the comment above for why this
+        matters on macOS.
+        """
+        executable = self._resolve_executable()
+        if executable is None:
+            return None
+
+        try:
+            with tempfile.TemporaryFile(mode="w+b") as stdout_file:
+                result = subprocess.run(
+                    [executable, "--Version"],
+                    stdout=stdout_file,
+                    stderr=subprocess.PIPE,
+                    timeout=_PROBE_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                stdout_file.seek(0)
+                stdout_bytes = stdout_file.read()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        version_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        return version_text or None
+
 
 def _get_str(track: dict[str, object], key: str) -> str | None:
     value = track.get(key)

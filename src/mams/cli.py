@@ -3,8 +3,9 @@ import argparse
 from pathlib import Path
 from rich.console import Console
 from .config import load_config, AppConfig
-from .db import DEFAULT_MIGRATIONS_DIR, migrate
+from .db import DEFAULT_MIGRATIONS_DIR, connect, migrate
 from . import inventory
+from . import inventory_repository
 from . import mediainfo
 console = Console()
 
@@ -36,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enrich each discovered file with MediaInfo technical metadata (slower; requires mediainfo).",
     )
+    scan_parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Skip database persistence; only write the JSON/summary reports.",
+    )
 
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
@@ -49,13 +55,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def run_inventory_scan(
-    config: AppConfig, *, json_output: bool, output: str, metadata: bool = False
+    config: AppConfig, *, json_output: bool, output: str, metadata: bool = False, use_db: bool = True
 ) -> inventory.InventoryReport:
     """Scan configured NAS categories and write JSON + summary reports.
 
-    Read-only: this only reads directory entries and file sizes (and, with
-    `metadata=True`, invokes the read-only `mediainfo` tool), and writes the
-    two report files below. It never touches the scanned media.
+    Read-only against the NAS: this only reads directory entries and file
+    sizes (and, with `metadata=True`, invokes the read-only `mediainfo`
+    tool). It never renames, moves, or deletes scanned media.
+
+    Unless `use_db` is False, the scan result is also persisted into the
+    SQLite inventory schema via `inventory_repository.persist_scan()`
+    (pending migrations are applied first). The JSON/summary report files
+    are generated from the in-memory scan result either way, independent of
+    whether database persistence succeeds — a database failure is reported
+    but does not prevent today's reports from being written.
     """
     provider = mediainfo.MediaInfoProvider() if metadata else None
     report = inventory.scan_categories(config.nas_categories, metadata_provider=provider)
@@ -67,6 +80,24 @@ def run_inventory_scan(
     summary_path = output_path.with_name(f"{output_path.stem}-summary.txt")
     summary_text = inventory.render_summary(report)
     summary_path.write_text(summary_text, encoding="utf-8")
+
+    if use_db:
+        migrate(config.database_path)
+        mediainfo_version = provider.get_version() if provider else None
+        connection = connect(config.database_path)
+        try:
+            scan_run_id = inventory_repository.persist_scan(
+                connection,
+                report,
+                config.nas_categories,
+                metadata_enabled=metadata,
+                mediainfo_version=mediainfo_version,
+            )
+            console.print(f"[dim]Database scan run:[/dim] {scan_run_id} (COMPLETE)")
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal to report generation
+            console.print(f"[yellow]Database persistence failed:[/yellow] {exc}")
+        finally:
+            connection.close()
 
     if json_output:
         console.print_json(report.to_json())
@@ -112,7 +143,13 @@ def main() -> None:
         console.print(f"Dry run: {config.dry_run}")
     elif args.command == "inventory":
         if args.inventory_command == "scan":
-            run_inventory_scan(config, json_output=args.json, output=args.output, metadata=args.metadata)
+            run_inventory_scan(
+                config,
+                json_output=args.json,
+                output=args.output,
+                metadata=args.metadata,
+                use_db=not args.no_db,
+            )
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 
