@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,21 @@ def test_connect_enables_foreign_keys(tmp_path: Path) -> None:
     with connect(db_path) as connection:
         row = connection.execute("PRAGMA foreign_keys").fetchone()
         assert row[0] == 1
+
+
+def test_connect_actually_enforces_foreign_keys(tmp_path: Path) -> None:
+    """PRAGMA foreign_keys reporting on is not the same as SQLite enforcing
+    it; confirm an invalid reference is actually rejected, not just that the
+    pragma value reads back as 1."""
+    db_path = tmp_path / "mams.db"
+
+    with connect(db_path) as connection:
+        connection.executescript(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY);"
+            "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id));"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO children (id, parent_id) VALUES (1, 999)")
 
 
 def test_connect_creates_parent_directory(tmp_path: Path) -> None:
