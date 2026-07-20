@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 import yaml
 
+from mams import inventory_repository
 from mams.cli import build_parser, run_inventory_scan, run_mediainfo
 from mams.config import load_config
 from mams.db import connect
+from mams.inventory import CategoryScan, InventoryReport, Layout, ScannedFile
 from mams.mediainfo import MediaInfo, MediaInfoOutcome, MediaInfoProvider
 
 
@@ -367,3 +369,123 @@ def test_run_inventory_scan_with_metadata_records_mediainfo_version(
     with connect(config.database_path) as connection:
         row = connection.execute("SELECT mediainfo_version FROM scan_runs").fetchone()
         assert row["mediainfo_version"] == "MediaInfoLib - v23.11"
+
+
+def _sentinel_report() -> InventoryReport:
+    sentinel_file = ScannedFile(
+        category="movies",
+        absolute_path="/sentinel/Sentinel Movie (1999).mkv",
+        relative_path="Sentinel Movie (1999).mkv",
+        filename="Sentinel Movie (1999).mkv",
+        extension=".mkv",
+        parent_directory="/sentinel",
+        size_bytes=999,
+        layout=Layout.MOVIE_FLAT,
+    )
+    return InventoryReport(
+        categories=(
+            CategoryScan(category="movies", root_path="/sentinel", exists=True, files=(sentinel_file,)),
+        )
+    )
+
+
+def test_run_inventory_scan_writes_database_derived_report_when_persist_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "Movies"
+    movies_root.mkdir()
+    (movies_root / "Movie (2001).mkv").write_bytes(b"\0" * 10)
+
+    sentinel = _sentinel_report()
+
+    def _fake_read(connection, categories):
+        return sentinel
+
+    monkeypatch.setattr(inventory_repository, "read_inventory_report", _fake_read)
+
+    config_path = _write_config(tmp_path, {"movies": str(movies_root)})
+    config = load_config(config_path)
+    output_path = tmp_path / "reports" / "library.json"
+
+    run_inventory_scan(config, json_output=False, output=str(output_path))
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["file_count"] == 1
+    assert payload["categories"][0]["files"][0]["filename"] == "Sentinel Movie (1999).mkv"
+    assert payload["categories"][0]["files"][0]["size_bytes"] == 999
+
+    # render_summary doesn't print filenames, only counts/sizes; the sentinel
+    # is 999 bytes vs. the real scan's 10, so the size line proves the
+    # summary was rendered from the database-derived report.
+    summary_path = output_path.with_name("library-summary.txt")
+    assert "999 B" in summary_path.read_text(encoding="utf-8")
+
+
+def test_run_inventory_scan_return_value_is_always_the_in_memory_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "Movies"
+    movies_root.mkdir()
+    (movies_root / "Movie (2001).mkv").write_bytes(b"\0" * 10)
+
+    def _fake_read(connection, categories):
+        return _sentinel_report()
+
+    monkeypatch.setattr(inventory_repository, "read_inventory_report", _fake_read)
+
+    config_path = _write_config(tmp_path, {"movies": str(movies_root)})
+    config = load_config(config_path)
+
+    report = run_inventory_scan(
+        config, json_output=False, output=str(tmp_path / "reports" / "library.json")
+    )
+
+    assert report.categories[0].files[0].filename == "Movie (2001).mkv"
+
+
+def test_run_inventory_scan_no_db_never_calls_read_inventory_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "Movies"
+    movies_root.mkdir()
+    (movies_root / "Movie (2001).mkv").write_bytes(b"\0" * 10)
+
+    def _fail_if_called(connection, categories):
+        raise AssertionError("read_inventory_report should not be called with --no-db")
+
+    monkeypatch.setattr(inventory_repository, "read_inventory_report", _fail_if_called)
+
+    config_path = _write_config(tmp_path, {"movies": str(movies_root)})
+    config = load_config(config_path)
+    output_path = tmp_path / "reports" / "library.json"
+
+    run_inventory_scan(config, json_output=False, output=str(output_path), use_db=False)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["categories"][0]["files"][0]["filename"] == "Movie (2001).mkv"
+
+
+def test_run_inventory_scan_persistence_failure_falls_back_to_in_memory_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "Movies"
+    movies_root.mkdir()
+    (movies_root / "Movie (2001).mkv").write_bytes(b"\0" * 10)
+
+    def _fail_persist(connection, report, categories, *, metadata_enabled, mediainfo_version):
+        raise RuntimeError("simulated persistence failure")
+
+    def _fail_if_called(connection, categories):
+        raise AssertionError("read_inventory_report should not be called when persist_scan failed")
+
+    monkeypatch.setattr(inventory_repository, "persist_scan", _fail_persist)
+    monkeypatch.setattr(inventory_repository, "read_inventory_report", _fail_if_called)
+
+    config_path = _write_config(tmp_path, {"movies": str(movies_root)})
+    config = load_config(config_path)
+    output_path = tmp_path / "reports" / "library.json"
+
+    run_inventory_scan(config, json_output=False, output=str(output_path))
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["categories"][0]["files"][0]["filename"] == "Movie (2001).mkv"

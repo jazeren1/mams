@@ -1,12 +1,17 @@
-"""Persistence for inventory scans: writes `InventoryReport` results into the
-SQLite inventory schema (`libraries`, `scan_runs`, `media_files`,
-`video_tracks`, `audio_tracks`, `subtitle_tracks`).
+"""Persistence and reconstruction for inventory scans: writes
+`InventoryReport` results into the SQLite inventory schema (`libraries`,
+`scan_runs`, `media_files`, `video_tracks`, `audio_tracks`,
+`subtitle_tracks`), and reads that schema back into the same domain models.
 
 This module owns all inventory-related SQL. `inventory.py` stays a pure,
 DB-unaware filesystem scanner; `cli.py` only calls `persist_scan()` and
-handles the result. It never renames, moves, or deletes anything on the
-NAS — the only filesystem interaction here is a read-only `stat()` per file
-to capture `mtime` (see `_stat_mtime`).
+`read_inventory_report()` and handles the results. It never renames, moves,
+or deletes anything on the NAS — the only filesystem interaction here is a
+read-only `stat()` per file to capture `mtime` on write (see `_stat_mtime`)
+and a read-only `is_dir()` per category to reconstruct `CategoryScan.exists`
+on read (see `read_inventory_report`).
+
+## Write path
 
 Reconciliation runs in two phases against one connection:
 
@@ -22,6 +27,18 @@ Reconciliation runs in two phases against one connection:
 A category whose root did not exist (`CategoryScan.exists is False`) is
 never reconciled and never contributes a missing-file flip, so a NAS
 mount being temporarily unavailable can never mark real files MISSING.
+
+## Read path
+
+`read_inventory_report()` reconstructs an `InventoryReport` identical in
+shape to what `inventory.scan_categories()` would produce, from the
+normalized tables — the tracks tables are canonical, there is no JSON blob
+to fall back on. Only `ACTIVE` files are included; `MISSING` rows stay in
+the database but are excluded from this export, matching the "database is
+canonical, filesystem is discovery" principle in docs/DATABASE.md. It reads
+in a fixed, small number of queries (libraries, media_files, and one query
+per track table, each joined/grouped in Python) regardless of file count —
+never one query per file — and never re-walks the filesystem.
 """
 
 from __future__ import annotations
@@ -29,8 +46,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from .inventory import CategoryScan, InventoryReport, ScannedFile
-from .mediainfo import MediaInfo
+from .inventory import CategoryScan, InventoryReport, Layout, ScannedFile
+from .mediainfo import AudioTrack, MediaInfo, SubtitleTrack, VideoTrack
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:
@@ -336,3 +353,176 @@ def persist_scan(
         raise
 
     return scan_run_id
+
+
+# --- read path -------------------------------------------------------------
+
+
+def _row_to_video_track(row: sqlite3.Row) -> VideoTrack:
+    return VideoTrack(
+        codec=row["codec"],
+        width=row["width"],
+        height=row["height"],
+        aspect_ratio=row["aspect_ratio"],
+        frame_rate=row["frame_rate"],
+        hdr_format=row["hdr_format"],
+        bit_depth=row["bit_depth"],
+        scan_type=row["scan_type"],
+    )
+
+
+def _row_to_audio_track(row: sqlite3.Row) -> AudioTrack:
+    return AudioTrack(
+        codec=row["codec"],
+        language=row["language"],
+        channels=row["channels"],
+        bitrate=row["bitrate"],
+        default=bool(row["is_default"]),
+    )
+
+
+def _row_to_subtitle_track(row: sqlite3.Row) -> SubtitleTrack:
+    return SubtitleTrack(
+        language=row["language"],
+        default=bool(row["is_default"]),
+        forced=bool(row["is_forced"]),
+    )
+
+
+def _fetch_tracks_by_media_file_id(
+    connection: sqlite3.Connection, table: str
+) -> dict[int, list[sqlite3.Row]]:
+    # `table` is always one of three hardcoded literals from this module's
+    # own callers below, never external input.
+    rows = connection.execute(
+        f"""
+        SELECT {table}.*
+        FROM {table}
+        JOIN media_files ON media_files.id = {table}.media_file_id
+        WHERE media_files.state = 'ACTIVE'
+        ORDER BY {table}.media_file_id, {table}.track_index
+        """
+    ).fetchall()
+    grouped: dict[int, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(row["media_file_id"], []).append(row)
+    return grouped
+
+
+def _reconstruct_media_info(
+    file_row: sqlite3.Row,
+    *,
+    video_tracks: list[sqlite3.Row],
+    audio_tracks: list[sqlite3.Row],
+    subtitle_tracks: list[sqlite3.Row],
+) -> tuple[MediaInfo | None, str | None]:
+    """Reconstruct (media_info, media_info_error) for one media_files row.
+
+    Three states, matching what the write path can leave behind:
+    - never probed (media_info_error and media_info_probed_at both NULL):
+      metadata stays absent, (None, None).
+    - last probe failed (media_info_error set): the general fields and
+      track tables hold whatever the last *successful* probe left there
+      (see `_update_media_info_failure`), which is not re-exposed here —
+      only the error is, matching what a failed scan records today.
+    - last probe succeeded (media_info_probed_at set, media_info_error
+      NULL): reconstruct the full MediaInfo, tracks included.
+    """
+    if file_row["media_info_error"] is not None:
+        return None, file_row["media_info_error"]
+
+    if file_row["media_info_probed_at"] is None:
+        return None, None
+
+    media_info = MediaInfo(
+        container=file_row["container"],
+        duration_seconds=file_row["duration_seconds"],
+        overall_bitrate=file_row["overall_bitrate"],
+        video_tracks=tuple(_row_to_video_track(row) for row in video_tracks),
+        audio_tracks=tuple(_row_to_audio_track(row) for row in audio_tracks),
+        subtitle_tracks=tuple(_row_to_subtitle_track(row) for row in subtitle_tracks),
+    )
+    return media_info, None
+
+
+def _row_to_scanned_file(
+    file_row: sqlite3.Row,
+    *,
+    category: str,
+    video_tracks_by_file: dict[int, list[sqlite3.Row]],
+    audio_tracks_by_file: dict[int, list[sqlite3.Row]],
+    subtitle_tracks_by_file: dict[int, list[sqlite3.Row]],
+) -> ScannedFile:
+    media_file_id = file_row["id"]
+    media_info, media_info_error = _reconstruct_media_info(
+        file_row,
+        video_tracks=video_tracks_by_file.get(media_file_id, []),
+        audio_tracks=audio_tracks_by_file.get(media_file_id, []),
+        subtitle_tracks=subtitle_tracks_by_file.get(media_file_id, []),
+    )
+    return ScannedFile(
+        category=category,
+        absolute_path=file_row["absolute_path"],
+        relative_path=file_row["relative_path"],
+        filename=file_row["filename"],
+        extension=file_row["extension"],
+        parent_directory=file_row["parent_directory"],
+        size_bytes=file_row["size_bytes"],
+        layout=Layout(file_row["layout"]),
+        media_info=media_info,
+        media_info_error=media_info_error,
+    )
+
+
+def read_inventory_report(connection: sqlite3.Connection, categories: dict[str, str]) -> InventoryReport:
+    """Reconstruct the canonical `InventoryReport` from the database.
+
+    `categories` (normally `config.nas_categories`) drives category order
+    and `root_path`/`exists` — the same authority config.yaml has on write
+    (see `sync_libraries`). A category not yet present in `libraries`
+    (never synced by a scan) simply contributes no files.
+
+    Only `ACTIVE` media_files rows are included; `MISSING` rows remain in
+    the database but are excluded here. Runs a fixed number of queries
+    (libraries, media_files, and the three track tables) regardless of how
+    many files exist, and never touches the filesystem beyond a single
+    `is_dir()` check per configured category.
+    """
+    library_rows = {row["category"]: row for row in connection.execute("SELECT * FROM libraries").fetchall()}
+
+    file_rows = connection.execute(
+        "SELECT * FROM media_files WHERE state = 'ACTIVE' ORDER BY library_id, relative_path"
+    ).fetchall()
+    files_by_library_id: dict[int, list[sqlite3.Row]] = {}
+    for row in file_rows:
+        files_by_library_id.setdefault(row["library_id"], []).append(row)
+
+    video_tracks_by_file = _fetch_tracks_by_media_file_id(connection, "video_tracks")
+    audio_tracks_by_file = _fetch_tracks_by_media_file_id(connection, "audio_tracks")
+    subtitle_tracks_by_file = _fetch_tracks_by_media_file_id(connection, "subtitle_tracks")
+
+    category_scans: list[CategoryScan] = []
+    for category, configured_root in categories.items():
+        root_path = str(Path(configured_root))
+        library_row = library_rows.get(category)
+        rows_for_category = files_by_library_id.get(library_row["id"], []) if library_row else []
+        scanned_files = tuple(
+            _row_to_scanned_file(
+                row,
+                category=category,
+                video_tracks_by_file=video_tracks_by_file,
+                audio_tracks_by_file=audio_tracks_by_file,
+                subtitle_tracks_by_file=subtitle_tracks_by_file,
+            )
+            for row in rows_for_category
+        )
+        category_scans.append(
+            CategoryScan(
+                category=category,
+                root_path=root_path,
+                exists=Path(configured_root).is_dir(),
+                files=scanned_files,
+            )
+        )
+
+    return InventoryReport(categories=tuple(category_scans))

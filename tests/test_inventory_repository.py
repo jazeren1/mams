@@ -440,3 +440,242 @@ def test_nas_fixture_files_are_never_modified_by_persist_scan(connection: sqlite
 
     after = (path.stat().st_size, path.stat().st_mtime_ns)
     assert before == after
+
+
+# --- read_inventory_report ------------------------------------------------
+
+
+def test_read_inventory_report_on_empty_database(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    empty_root = tmp_path / "Movies"
+    empty_root.mkdir()
+
+    result = repo.read_inventory_report(connection, {"movies": str(empty_root)})
+
+    assert len(result.categories) == 1
+    category = result.categories[0]
+    assert category.category == "movies"
+    assert category.exists is True
+    assert category.files == ()
+    assert result.file_count == 0
+
+
+def test_read_inventory_report_missing_root_reports_not_exists(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    missing_root = tmp_path / "does-not-exist"
+
+    result = repo.read_inventory_report(connection, {"movies": str(missing_root)})
+
+    assert result.categories[0].exists is False
+    assert result.categories[0].files == ()
+
+
+def test_read_inventory_report_one_category_one_file(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    scanned = _scanned_file(tmp_path)
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=False, mediainfo_version=None)
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    assert result.file_count == 1
+    file = result.categories[0].files[0]
+    assert file.filename == scanned.filename
+    assert file.category == "movies"
+    assert file.size_bytes == scanned.size_bytes
+    assert file.layout == Layout.MOVIE_FLAT
+
+
+def test_read_inventory_report_preserves_configured_category_order(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    movies_root = tmp_path / "Movies"
+    tv_root = tmp_path / "TV"
+    fitness_root = tmp_path / "Fitness"
+    for root in (movies_root, tv_root, fitness_root):
+        root.mkdir()
+
+    # Sync libraries in a different order than the categories dict below, to
+    # prove output order comes from the categories dict, not library
+    # insertion/id order.
+    repo.sync_libraries(connection, {"tv": str(tv_root), "movies": str(movies_root), "fitness": str(fitness_root)})
+    categories = {"fitness": str(fitness_root), "movies": str(movies_root), "tv": str(tv_root)}
+
+    result = repo.read_inventory_report(connection, categories)
+
+    assert [c.category for c in result.categories] == ["fitness", "movies", "tv"]
+
+
+def test_read_inventory_report_file_ordering_matches_scanner(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    files = [
+        _scanned_file(tmp_path, name="Zebra (2001).mkv"),
+        _scanned_file(tmp_path, name="Apple (2002).mkv"),
+        _scanned_file(tmp_path, name="Mango (2003).mkv"),
+    ]
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, files),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=False, mediainfo_version=None)
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    filenames = [f.filename for f in result.categories[0].files]
+    assert filenames == ["Apple (2002).mkv", "Mango (2003).mkv", "Zebra (2001).mkv"]
+    assert filenames == sorted(filenames)
+
+
+def test_read_inventory_report_excludes_missing_files(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    scanned = _scanned_file(tmp_path)
+    report1 = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report1, {"movies": str(tmp_path)}, metadata_enabled=False, mediainfo_version=None)
+
+    report2 = InventoryReport(categories=(_category_scan("movies", tmp_path, []),))
+    repo.persist_scan(connection, report2, {"movies": str(tmp_path)}, metadata_enabled=False, mediainfo_version=None)
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    assert result.file_count == 0
+    row = connection.execute(
+        "SELECT state FROM media_files WHERE absolute_path = ?", (scanned.absolute_path,)
+    ).fetchone()
+    assert row["state"] == "MISSING"
+
+
+def test_read_inventory_report_reconstructs_general_media_info_fields(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    media_info = _sample_media_info()
+    scanned = _scanned_file(tmp_path, media_info=media_info)
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1")
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    file = result.categories[0].files[0]
+    assert file.media_info is not None
+    assert file.media_info.container == "Matroska"
+    assert file.media_info.duration_seconds == 120.0
+    assert file.media_info.overall_bitrate == 5_000_000
+    assert file.media_info_error is None
+
+
+def test_read_inventory_report_reconstructs_tracks_in_track_index_order(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    media_info = MediaInfo(
+        container="Matroska",
+        duration_seconds=100.0,
+        overall_bitrate=1000,
+        video_tracks=(
+            VideoTrack(
+                codec="H.264", width=1280, height=720, aspect_ratio="16:9",
+                frame_rate=25.0, hdr_format=None, bit_depth=8, scan_type="Progressive",
+            ),
+            VideoTrack(
+                codec="HEVC", width=1920, height=1080, aspect_ratio="16:9",
+                frame_rate=23.976, hdr_format="HDR10", bit_depth=10, scan_type="Progressive",
+            ),
+        ),
+        audio_tracks=(
+            AudioTrack(codec="AAC", language="eng", channels=2, bitrate=128_000, default=True),
+            AudioTrack(codec="AC3", language="jpn", channels=6, bitrate=640_000, default=False),
+        ),
+        subtitle_tracks=(
+            SubtitleTrack(language="eng", default=True, forced=False),
+            SubtitleTrack(language="spa", default=False, forced=True),
+        ),
+    )
+    scanned = _scanned_file(tmp_path, media_info=media_info)
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1")
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    reconstructed = result.categories[0].files[0].media_info
+    assert reconstructed is not None
+    assert [t.codec for t in reconstructed.video_tracks] == ["H.264", "HEVC"]
+    assert [t.language for t in reconstructed.audio_tracks] == ["eng", "jpn"]
+    assert [t.language for t in reconstructed.subtitle_tracks] == ["eng", "spa"]
+    assert reconstructed == media_info
+
+
+def test_read_inventory_report_reconstructs_metadata_error(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    scanned = _scanned_file(tmp_path, media_info=None, media_info_error="mediainfo timed out after 60s")
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1")
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    file = result.categories[0].files[0]
+    assert file.media_info is None
+    assert file.media_info_error == "mediainfo timed out after 60s"
+
+
+def test_read_inventory_report_metadata_absent_remains_absent(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    scanned = _scanned_file(tmp_path)
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned]),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=False, mediainfo_version=None)
+
+    result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    file = result.categories[0].files[0]
+    assert file.media_info is None
+    assert file.media_info_error is None
+
+
+def test_read_inventory_report_is_semantically_equal_to_original_after_persistence(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    media_info = _sample_media_info()
+    scanned_a = _scanned_file(tmp_path, name="A (2001).mkv", media_info=media_info)
+    scanned_b = _scanned_file(tmp_path, name="B (2002).mkv")
+    original = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned_a, scanned_b]),))
+
+    repo.persist_scan(
+        connection, original, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1"
+    )
+    reconstructed = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    assert reconstructed == original
+
+
+def test_read_inventory_report_render_summary_matches_in_memory(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    from mams.inventory import render_summary
+
+    media_info = _sample_media_info()
+    scanned_a = _scanned_file(tmp_path, name="A (2001).mkv", media_info=media_info)
+    scanned_b = _scanned_file(tmp_path, name="B (2002).mkv")
+    original = InventoryReport(categories=(_category_scan("movies", tmp_path, [scanned_a, scanned_b]),))
+
+    repo.persist_scan(
+        connection, original, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1"
+    )
+    reconstructed = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+
+    assert render_summary(reconstructed) == render_summary(original)
+
+
+def test_read_inventory_report_uses_a_bounded_number_of_queries(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    media_info = _sample_media_info()
+    files = [_scanned_file(tmp_path, name=f"Movie {i:03d}.mkv", media_info=media_info) for i in range(20)]
+    report = InventoryReport(categories=(_category_scan("movies", tmp_path, files),))
+    repo.persist_scan(connection, report, {"movies": str(tmp_path)}, metadata_enabled=True, mediainfo_version="v1")
+
+    executed: list[str] = []
+    connection.set_trace_callback(executed.append)
+    try:
+        result = repo.read_inventory_report(connection, {"movies": str(tmp_path)})
+    finally:
+        connection.set_trace_callback(None)
+
+    assert result.file_count == 20
+    select_statements = [sql for sql in executed if sql.strip().upper().startswith("SELECT")]
+    assert len(select_statements) < 10, (
+        f"expected a bounded query count independent of file count (20 files), "
+        f"got {len(select_statements)}: {select_statements}"
+    )
