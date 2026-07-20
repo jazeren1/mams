@@ -71,13 +71,13 @@ def test_migrate_records_schema_version_rows(tmp_path: Path) -> None:
         assert versions == [1, 2]
 
 
-def test_migrate_against_real_initial_migration(tmp_path: Path) -> None:
+def test_migrate_against_real_migrations_dir(tmp_path: Path) -> None:
     db_path = tmp_path / "mams.db"
     repo_migrations_dir = Path(__file__).resolve().parents[1] / "database" / "migrations"
 
     applied = migrate(db_path, repo_migrations_dir)
 
-    assert applied == [1]
+    assert applied == [1, 2]
     with connect(db_path) as connection:
         tables = {
             row["name"]
