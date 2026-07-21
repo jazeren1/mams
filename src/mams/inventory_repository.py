@@ -28,6 +28,38 @@ A category whose root did not exist (`CategoryScan.exists is False`) is
 never reconciled and never contributes a missing-file flip, so a NAS
 mount being temporarily unavailable can never mark real files MISSING.
 
+## Change events
+
+Phase 2 also records an immutable `scan_changes` row for every file whose
+canonical state actually changed, in the same transaction as the
+`media_files`/track writes it describes — a rollback discards both
+together, never one without the other. Determined by comparing a full
+before/after snapshot per file (`_reconcile_file`):
+
+- no prior row → `ADDED`.
+- prior row was `MISSING` → `RESTORED`, carrying any other field changes
+  that happened at the same time (a file can only transition MISSING →
+  ACTIVE by being rediscovered; it doesn't also get a separate `UPDATED`
+  event in the same scan).
+- prior row was `ACTIVE` and a comparable field changed → `UPDATED`, with
+  changed field names and old/new values in `details_json`.
+- prior row was `ACTIVE` and nothing comparable changed → no event.
+  Timestamps/scan-tracking columns (`updated_at`, `last_seen_scan_id`,
+  `media_info_probed_at`, ...) are never compared, so an identical repeat
+  scan produces zero events. A scan without `--metadata` never touches
+  metadata columns or track tables, so it can't produce a metadata-change
+  event either — there's nothing new to diff.
+- `MISSING` events come from `mark_missing_files`, which selects the
+  about-to-flip rows before updating them so each gets its own event.
+
+Track content is compared by value (`VideoTrack`/`AudioTrack`/
+`SubtitleTrack` equality), not by "were the rows touched" — delete+reinsert
+always touches rows, so a re-probe that finds identical tracks must not
+produce a false `UPDATED`. `details_json` for a track change is
+`{"field": "video_tracks", "old_count": N, "new_count": M}` — counts only,
+never the track payload itself, so this can't become a second MediaInfo
+store (see docs/DATABASE.md).
+
 ## Read path
 
 `read_inventory_report()` reconstructs an `InventoryReport` identical in
@@ -43,6 +75,7 @@ never one query per file — and never re-walks the filesystem.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -100,14 +133,33 @@ def start_scan_run(
 def complete_scan_run(
     connection: sqlite3.Connection, scan_run_id: int, *, file_count: int, total_size_bytes: int
 ) -> None:
+    """Finalize a scan_runs row, including a one-query rollup of this scan's
+    change-event counts by type (see the module docstring for why these
+    columns exist)."""
+    counts = {
+        row["change_type"]: row["n"]
+        for row in connection.execute(
+            "SELECT change_type, COUNT(*) AS n FROM scan_changes WHERE scan_run_id = ? GROUP BY change_type",
+            (scan_run_id,),
+        ).fetchall()
+    }
     connection.execute(
         """
         UPDATE scan_runs
         SET status = 'COMPLETE', completed_at = CURRENT_TIMESTAMP,
-            file_count = ?, total_size_bytes = ?
+            file_count = ?, total_size_bytes = ?,
+            added_count = ?, updated_count = ?, missing_count = ?, restored_count = ?
         WHERE id = ?
         """,
-        (file_count, total_size_bytes, scan_run_id),
+        (
+            file_count,
+            total_size_bytes,
+            counts.get("ADDED", 0),
+            counts.get("UPDATED", 0),
+            counts.get("MISSING", 0),
+            counts.get("RESTORED", 0),
+            scan_run_id,
+        ),
     )
 
 
@@ -271,6 +323,166 @@ def _apply_media_info(connection: sqlite3.Connection, media_file_id: int, scanne
         _update_media_info_failure(connection, media_file_id, scanned_file.media_info_error)
 
 
+# --- change-event generation -------------------------------------------------
+
+_COMPARABLE_MEDIA_FILE_FIELDS: tuple[str, ...] = (
+    "library_id",
+    "relative_path",
+    "filename",
+    "extension",
+    "parent_directory",
+    "layout",
+    "size_bytes",
+    "mtime",
+    "container",
+    "duration_seconds",
+    "overall_bitrate",
+    "media_info_error",
+)
+
+
+def _field_changes(before: sqlite3.Row, after: sqlite3.Row) -> list[dict[str, object]]:
+    """Compare a media_files row's comparable scalar fields before/after
+    this scan's writes. Deliberately excludes state (its own MISSING/
+    RESTORED event), and bookkeeping/timestamp columns (last_seen_scan_id,
+    updated_at, media_info_probed_at, created_at, first_seen_scan_id,
+    missing_since_scan_id) that change on every touch but carry no content."""
+    changes: list[dict[str, object]] = []
+    for field in _COMPARABLE_MEDIA_FILE_FIELDS:
+        old, new = before[field], after[field]
+        if old != new:
+            changes.append({"field": field, "old": old, "new": new})
+    return changes
+
+
+def _track_changes(
+    before_video: tuple[VideoTrack, ...],
+    before_audio: tuple[AudioTrack, ...],
+    before_subtitle: tuple[SubtitleTrack, ...],
+    after_media_info: MediaInfo,
+) -> list[dict[str, object]]:
+    """Compare effective track content, not whether rows were touched --
+    delete+reinsert always touches rows, so an identical re-probe must not
+    produce a false change. Reports counts only, never the track payload."""
+    changes: list[dict[str, object]] = []
+    for field, before_tracks, after_tracks in (
+        ("video_tracks", before_video, after_media_info.video_tracks),
+        ("audio_tracks", before_audio, after_media_info.audio_tracks),
+        ("subtitle_tracks", before_subtitle, after_media_info.subtitle_tracks),
+    ):
+        if before_tracks != after_tracks:
+            changes.append({"field": field, "old_count": len(before_tracks), "new_count": len(after_tracks)})
+    return changes
+
+
+def _serialize_details(changes: list[dict[str, object]]) -> str | None:
+    if not changes:
+        return None
+    return json.dumps({"changes": changes}, sort_keys=True, separators=(",", ":"))
+
+
+def _record_change(
+    connection: sqlite3.Connection,
+    *,
+    scan_run_id: int,
+    media_file_id: int,
+    library_id: int,
+    change_type: str,
+    absolute_path: str,
+    changes: list[dict[str, object]] | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO scan_changes (scan_run_id, media_file_id, library_id, change_type, absolute_path, details_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (scan_run_id, media_file_id, library_id, change_type, absolute_path, _serialize_details(changes or [])),
+    )
+
+
+def _fetch_single_file_tracks(connection: sqlite3.Connection, table: str, media_file_id: int) -> list[sqlite3.Row]:
+    # `table` is always one of three hardcoded literals from this module's
+    # own callers below, never external input.
+    return connection.execute(
+        f"SELECT * FROM {table} WHERE media_file_id = ? ORDER BY track_index", (media_file_id,)
+    ).fetchall()
+
+
+def _fetch_before_tracks(
+    connection: sqlite3.Connection, media_file_id: int
+) -> tuple[tuple[VideoTrack, ...], tuple[AudioTrack, ...], tuple[SubtitleTrack, ...]]:
+    return (
+        tuple(_row_to_video_track(r) for r in _fetch_single_file_tracks(connection, "video_tracks", media_file_id)),
+        tuple(_row_to_audio_track(r) for r in _fetch_single_file_tracks(connection, "audio_tracks", media_file_id)),
+        tuple(
+            _row_to_subtitle_track(r)
+            for r in _fetch_single_file_tracks(connection, "subtitle_tracks", media_file_id)
+        ),
+    )
+
+
+def _reconcile_file(
+    connection: sqlite3.Connection,
+    scanned_file: ScannedFile,
+    *,
+    library_id: int,
+    scan_run_id: int,
+    metadata_enabled: bool,
+) -> None:
+    """Upsert one file and record the resulting ADDED/UPDATED/RESTORED
+    scan_changes event, if any. See the module docstring's "Change events"
+    section for the exact rules."""
+    before_row = connection.execute(
+        "SELECT * FROM media_files WHERE absolute_path = ?", (scanned_file.absolute_path,)
+    ).fetchone()
+
+    before_tracks = None
+    if before_row is not None and metadata_enabled and scanned_file.media_info is not None:
+        before_tracks = _fetch_before_tracks(connection, before_row["id"])
+
+    media_file_id = _upsert_media_file(connection, scanned_file, library_id=library_id, scan_run_id=scan_run_id)
+    if metadata_enabled:
+        _apply_media_info(connection, media_file_id, scanned_file)
+
+    if before_row is None:
+        _record_change(
+            connection,
+            scan_run_id=scan_run_id,
+            media_file_id=media_file_id,
+            library_id=library_id,
+            change_type="ADDED",
+            absolute_path=scanned_file.absolute_path,
+        )
+        return
+
+    after_row = connection.execute("SELECT * FROM media_files WHERE id = ?", (media_file_id,)).fetchone()
+    changes = _field_changes(before_row, after_row)
+    if before_tracks is not None:
+        assert scanned_file.media_info is not None
+        changes.extend(_track_changes(*before_tracks, scanned_file.media_info))
+
+    if before_row["state"] == "MISSING":
+        _record_change(
+            connection,
+            scan_run_id=scan_run_id,
+            media_file_id=media_file_id,
+            library_id=library_id,
+            change_type="RESTORED",
+            absolute_path=scanned_file.absolute_path,
+            changes=changes,
+        )
+    elif changes:
+        _record_change(
+            connection,
+            scan_run_id=scan_run_id,
+            media_file_id=media_file_id,
+            library_id=library_id,
+            change_type="UPDATED",
+            absolute_path=scanned_file.absolute_path,
+            changes=changes,
+        )
+
+
 def persist_category_scan(
     connection: sqlite3.Connection,
     category_scan: CategoryScan,
@@ -279,25 +491,38 @@ def persist_category_scan(
     scan_run_id: int,
     metadata_enabled: bool,
 ) -> None:
-    """Reconcile one already-scanned category's files into `media_files`.
+    """Reconcile one already-scanned category's files into `media_files`,
+    recording an ADDED/UPDATED/RESTORED scan_changes event per file as
+    appropriate (see `_reconcile_file`).
 
     Only call this for a `CategoryScan` whose root existed; callers must
     not invoke this (or `mark_missing_files`) for a missing root.
     """
     for scanned_file in category_scan.files:
-        media_file_id = _upsert_media_file(
-            connection, scanned_file, library_id=library_id, scan_run_id=scan_run_id
+        _reconcile_file(
+            connection,
+            scanned_file,
+            library_id=library_id,
+            scan_run_id=scan_run_id,
+            metadata_enabled=metadata_enabled,
         )
-        if metadata_enabled:
-            _apply_media_info(connection, media_file_id, scanned_file)
 
 
 def mark_missing_files(connection: sqlite3.Connection, *, library_id: int, scan_run_id: int) -> None:
-    """Flip ACTIVE files in this library not seen by this scan to MISSING.
+    """Flip ACTIVE files in this library not seen by this scan to MISSING,
+    recording a MISSING scan_changes event for each.
 
     Track rows are left untouched — only an actual `media_files` delete
     (never performed here) cascades to them.
     """
+    newly_missing = connection.execute(
+        """
+        SELECT id, absolute_path FROM media_files
+        WHERE library_id = ? AND state = 'ACTIVE' AND last_seen_scan_id < ?
+        """,
+        (library_id, scan_run_id),
+    ).fetchall()
+
     connection.execute(
         """
         UPDATE media_files
@@ -306,6 +531,16 @@ def mark_missing_files(connection: sqlite3.Connection, *, library_id: int, scan_
         """,
         (scan_run_id, library_id, scan_run_id),
     )
+
+    for row in newly_missing:
+        _record_change(
+            connection,
+            scan_run_id=scan_run_id,
+            media_file_id=row["id"],
+            library_id=library_id,
+            change_type="MISSING",
+            absolute_path=row["absolute_path"],
+        )
 
 
 def persist_scan(
