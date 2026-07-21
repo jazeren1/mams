@@ -817,7 +817,7 @@ class LibraryStats:
 
 
 @dataclass(frozen=True)
-class RecentScanSummary:
+class ScanRunRecord:
     id: int
     status: str
     started_at: str
@@ -850,7 +850,7 @@ class InventoryStats:
     video_track_count: int
     audio_track_count: int
     subtitle_track_count: int
-    most_recent_scan: RecentScanSummary | None
+    most_recent_scan: ScanRunRecord | None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -983,8 +983,8 @@ def search_media_files(
     return [_row_to_media_file_record(row) for row in rows]
 
 
-def _row_to_recent_scan_summary(row: sqlite3.Row) -> RecentScanSummary:
-    return RecentScanSummary(
+def _row_to_scan_run_record(row: sqlite3.Row) -> ScanRunRecord:
+    return ScanRunRecord(
         id=row["id"],
         status=row["status"],
         started_at=row["started_at"],
@@ -1084,5 +1084,105 @@ def get_inventory_stats(connection: sqlite3.Connection) -> InventoryStats:
         video_track_count=track_row["video_count"],
         audio_track_count=track_row["audio_count"],
         subtitle_track_count=track_row["subtitle_count"],
-        most_recent_scan=_row_to_recent_scan_summary(scan_row) if scan_row is not None else None,
+        most_recent_scan=_row_to_scan_run_record(scan_row) if scan_row is not None else None,
     )
+
+
+# --- scan lookups / change-event queries (mams inventory diff) --------------
+
+
+@dataclass(frozen=True)
+class ScanChangeRecord:
+    """One scan_changes row, with its library's category resolved."""
+
+    id: int
+    scan_run_id: int
+    change_type: str
+    absolute_path: str
+    previous_absolute_path: str | None
+    category: str | None
+    details: dict[str, object] | None
+    created_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def get_scan_run(connection: sqlite3.Connection, scan_run_id: int) -> ScanRunRecord | None:
+    row = connection.execute("SELECT * FROM scan_runs WHERE id = ?", (scan_run_id,)).fetchone()
+    return _row_to_scan_run_record(row) if row is not None else None
+
+
+def get_latest_completed_scan_run(connection: sqlite3.Connection) -> ScanRunRecord | None:
+    row = connection.execute(
+        "SELECT * FROM scan_runs WHERE status = 'COMPLETE' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return _row_to_scan_run_record(row) if row is not None else None
+
+
+def _row_to_scan_change_record(row: sqlite3.Row) -> ScanChangeRecord:
+    details = json.loads(row["details_json"]) if row["details_json"] is not None else None
+    return ScanChangeRecord(
+        id=row["id"],
+        scan_run_id=row["scan_run_id"],
+        change_type=row["change_type"],
+        absolute_path=row["absolute_path"],
+        previous_absolute_path=row["previous_absolute_path"],
+        category=row["category"],
+        details=details,
+        created_at=row["created_at"],
+    )
+
+
+def list_scan_changes(
+    connection: sqlite3.Connection,
+    *,
+    scan_run_id: int | None = None,
+    from_scan_id: int | None = None,
+    to_scan_id: int | None = None,
+    change_type: str | None = None,
+    category: str | None = None,
+) -> list[ScanChangeRecord]:
+    """List recorded scan_changes events -- immutable evidence, not a
+    reconstructed historical snapshot (see docs/DATABASE.md).
+
+    Two mutually intended usages:
+    - `scan_run_id` alone: every event from that one scan.
+    - `from_scan_id` and `to_scan_id` together: an event-range view, events
+      with `from_scan_id < scan_run_id <= to_scan_id`. This aggregates
+      recorded events across scans; it is not a diff between two full
+      inventory snapshots.
+
+    `change_type`/`category` are optional additional filters. Ordered by
+    (scan_run_id, change_type, absolute_path) for determinism. Single
+    query, joined against `libraries` for category resolution.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if scan_run_id is not None:
+        clauses.append("scan_changes.scan_run_id = ?")
+        params.append(scan_run_id)
+    if from_scan_id is not None:
+        clauses.append("scan_changes.scan_run_id > ?")
+        params.append(from_scan_id)
+    if to_scan_id is not None:
+        clauses.append("scan_changes.scan_run_id <= ?")
+        params.append(to_scan_id)
+    if change_type is not None:
+        clauses.append("scan_changes.change_type = ?")
+        params.append(change_type)
+    if category is not None:
+        clauses.append("libraries.category = ?")
+        params.append(category)
+
+    sql = """
+        SELECT scan_changes.*, libraries.category AS category
+        FROM scan_changes
+        LEFT JOIN libraries ON libraries.id = scan_changes.library_id
+    """
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY scan_changes.scan_run_id, scan_changes.change_type, scan_changes.absolute_path"
+
+    rows = connection.execute(sql, params).fetchall()
+    return [_row_to_scan_change_record(row) for row in rows]
