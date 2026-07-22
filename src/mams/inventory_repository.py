@@ -778,6 +778,7 @@ class MediaFileRecord:
     """One media_files row, flattened with its category and track counts."""
 
     id: int
+    library_id: int
     category: str
     absolute_path: str
     relative_path: str
@@ -874,6 +875,7 @@ _MEDIA_FILE_BASE_SELECT = """
 def _row_to_media_file_record(row: sqlite3.Row) -> MediaFileRecord:
     return MediaFileRecord(
         id=row["id"],
+        library_id=row["library_id"],
         category=row["category"],
         absolute_path=row["absolute_path"],
         relative_path=row["relative_path"],
