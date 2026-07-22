@@ -129,6 +129,203 @@ This milestone demonstrates that the canonical inventory is now queryable and it
 
 ---
 
+# Milestone 6 – Read-Only Findings Engine
+
+Date: 2026-07-22
+
+## Summary
+
+This milestone added a deterministic, read-only findings engine on top of
+the canonical inventory: a `findings` table (migration
+`0004_findings.sql`), a pure rule engine (`src/mams/findings.py`) with nine
+initial rules, an atomic reconciliation service that creates/updates/
+resolves/reactivates findings without ever duplicating them
+(`findings_service.py` / `findings_repository.py`), a query layer (list/
+get/stats), and four CLI commands (`mams findings evaluate/list/stats/
+show`). Findings evaluation only reads `media_files`/track data and writes
+to the new `findings` table — it never touches the NAS or Plex.
+
+## Validation Results
+
+- Migration `0004_findings.sql` implemented and validated: severity/status
+  `CHECK` constraints, `(rule_code, media_file_id)` uniqueness (including
+  that it does *not* block the same rule firing for a different file),
+  and the documented `ON DELETE SET NULL` retention behavior for
+  `media_file_id`/`library_id` (a finding's row and content survive a
+  `media_files`/`libraries` delete, matching `scan_changes`'s established
+  pattern) — all exercised directly against the migration file, not just
+  through the ORM-like repository layer.
+- All nine rules (`missing_file`, `metadata_error`, `metadata_not_probed`,
+  `unknown_layout`, `zero_byte_file`, `suspiciously_small_media`,
+  `no_video_track`, `no_audio_track`, `unexpected_extension`) validated
+  both triggering and not triggering, as pure functions of a
+  `MediaFileRecord` with no SQL access. Confirmed: `metadata_not_probed`
+  and `metadata_error` are mutually exclusive (a probe that ran and
+  failed is never also reported as "never probed"); `no_video_track`/
+  `no_audio_track` require a *successful* probe (never fire before a
+  probe, or after a failed one); `suspiciously_small_media` and
+  `zero_byte_file` are mutually exclusive by construction (a 0-byte file
+  is reported exactly once); `suspiciously_small_media`'s boundary is
+  exact (triggers at threshold − 1 byte, not at the threshold itself);
+  `missing_file` is the only rule evaluated against a `MISSING` row —
+  confirmed a record with every other rule's trigger condition *and*
+  `state='MISSING'` produces only the `missing_file` finding, never the
+  others re-firing on stale pre-missing data. `evaluate_all()` confirmed
+  deterministically ordered and stable across independent calls on the
+  same input.
+- Reconciliation lifecycle validated: a new finding is created `ACTIVE`
+  with `first_detected_at`/`last_detected_at` set; a repeated evaluation
+  against unchanged inventory creates no duplicate and preserves the
+  finding's id and `first_detected_at` exactly, while `last_detected_at`
+  still advances and `updated_at` does *not* churn when content is
+  unchanged (and does change when it is, verified by moving a file to a
+  different library so its `library_id` content differs); a condition's
+  disappearance resolves its finding with `resolved_at` set; its
+  reappearance reactivates the same finding id, clears `resolved_at`, and
+  preserves the original `first_detected_at`; an `IGNORED` finding's
+  status/`resolved_at` are proven untouched by reconciliation in *both*
+  directions — condition still present, and condition gone — with only
+  `last_detected_at` advancing in the former case; a forced mid-
+  reconciliation failure (one finding needing to resolve, another needing
+  to be created, in the same run) leaves neither change applied,
+  confirming the whole reconciliation is atomic; `evidence_json` verified
+  byte-for-byte deterministic across independent runs against independent
+  databases, not just structurally equal.
+- Query layer (list/get/stats) validated: every filter (status, severity,
+  rule_code, category, media_file_id) individually and combined with AND,
+  `limit`, category/path resolution via join (including the case where
+  `media_file_id` is detached and path/category become unresolvable but
+  the finding row survives), deterministic ordering (grouped by file, then
+  severity — CRITICAL/ERROR before WARNING/INFO — then by each rule's
+  declared position in `findings.ALL_RULES`, matching this document's
+  suggested CLI output shape), ordering stability across repeated calls,
+  finding lookup by id (including an unknown id), stats totals (by status,
+  and severity/rule breakdowns restricted to `ACTIVE` findings), and
+  bounded query counts via `set_trace_callback` (`list_findings`: exactly
+  one `SELECT`; `get_findings_stats`: at most three) regardless of row
+  count — never one query per row.
+- CLI (`evaluate`/`list`/`stats`/`show`) validated for both text and JSON
+  output, filter combinations, repeated evaluation producing zero
+  duplicates through the full CLI path, empty-result handling, and a
+  clear, non-destructive error (no database mutation) for an unknown
+  finding id — seeded through the real `run_inventory_scan()` CLI path,
+  not a hand-built database, so these tests exercise the same code path a
+  real user invocation does.
+
+## Sandbox Lifecycle Demonstration
+
+Run against an isolated sandbox library (separate from the production
+database) through the real CLI, proving the full lifecycle end to end:
+
+1. A zero-byte `Broken.mkv` and a normal `Good.mkv` scanned, then
+   evaluated: `zero_byte_file` created `ACTIVE` for `Broken.mkv` (plus
+   `metadata_not_probed` for both files, since `--metadata` wasn't used).
+2. Re-running `findings evaluate` against the same, unchanged inventory:
+   `Created: 0`, `Unchanged: 3` — no duplicates.
+3. `Broken.mkv` overwritten with real content and rescanned, then
+   evaluated: the `zero_byte_file` finding transitioned to `RESOLVED` with
+   `resolved_at` set, `first_detected_at` unchanged.
+4. `Broken.mkv` truncated back to zero bytes and rescanned, then
+   evaluated: the *same* finding id reactivated to `ACTIVE`,
+   `resolved_at` cleared, and `first_detected_at` identical to step 1's
+   value (`2026-07-22 15:38:54` in the actual run) — confirming
+   reactivation is not a delete-and-recreate under the hood.
+
+No NAS media was modified at any point (the sandbox library lives entirely
+under a temp directory, not the real NAS).
+
+## Production Validation
+
+Evaluated against the real production inventory database (unchanged since
+Milestone 5: 3,513 `ACTIVE` + 2 `MISSING` = 3,515 `media_files` rows, ~5.8
+TB). Findings evaluation reads only the database — it never re-scans or
+otherwise touches the NAS, so this required no NAS access and modified no
+NAS media.
+
+**First evaluation:** 14 findings created, 0 resolved:
+
+| Rule                       | Severity | Count |
+|----------------------------|----------|-------|
+| `missing_file`             | ERROR    | 2     |
+| `no_video_track`           | ERROR    | 5     |
+| `no_audio_track`           | WARNING  | 3     |
+| `suspiciously_small_media` | WARNING  | 4     |
+
+`metadata_error`, `metadata_not_probed`, `unknown_layout`, `zero_byte_file`,
+and `unexpected_extension` all produced zero findings.
+
+**Repeated evaluation** (immediately after, no inventory change in
+between): `Created: 0`, `Unchanged: 14`, `Resolved: 0` — confirming the
+no-duplicate/no-false-churn guarantee holds at full production scale, not
+only against small unit-test fixtures.
+
+### Plausibility review
+
+- **`missing_file` (2): `Movies/test.mkv` and `Movies/test2.mkv`.** These
+  are the temporary artifacts created during Milestone 5's sandbox
+  ADDED/MISSING/RESTORED validation sequence, left in a `MISSING` state
+  from that milestone's own database (a real scan of the actual NAS would
+  no longer see them, since they were never real library content) — not
+  production defects. Documented here per this milestone's validation
+  plan rather than treated as a rule bug. Correctly, neither produces a
+  `zero_byte_file` finding despite their tiny recorded size (4 and 43
+  bytes) — `zero_byte_file` and every other non-`missing_file` rule is
+  scoped to `ACTIVE` rows only (see `findings.py`), so a `MISSING` file
+  is reported exactly once, by `missing_file` alone.
+- **`no_video_track` (5) / `no_audio_track` (3): "Slender Man", "The
+  Hobbit", one Sopranos episode, and two "Brak Show" files.** Internally
+  consistent: 3 of the 5 `no_video_track` files (Slender Man, Hobbit,
+  Sopranos) also lack an audio track, while the two Brak Show files have
+  audio but not video — plausible for rips where video encoding/muxing
+  failed but audio survived, and a signal worth a human's attention rather
+  than an artifact of the rule itself.
+- **`suspiciously_small_media` (4): Fraggle Rock, Buffy, and the same two
+  Brak Show files already flagged `no_video_track`.** The overlap with
+  `no_video_track` on the Brak Show files is corroborating evidence, not
+  double-counting — two different rules independently surfacing the same
+  underlying broken-rip files is exactly the intended behavior, not a
+  bug.
+- **Zero `metadata_error`/`metadata_not_probed`/`unknown_layout`/
+  `unexpected_extension`** is consistent with Milestone 4/5's established
+  baseline (zero probe errors across the full library, every file already
+  MediaInfo-probed, every layout already classified, and the scanner only
+  ever discovers files within the configured extension set to begin with).
+
+No NAS media was modified during any part of this validation — findings
+evaluation is read-only against the database by construction, and the NAS
+was not even mounted for the production evaluation run.
+
+## Quality Gates
+
+- 346 automated tests passing
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This validation matters for a different reason than Milestones 4/5's did:
+those validated that a write path faithfully reflects the filesystem at
+scale, while this milestone's core risk was reconciliation *idempotency*
+and *non-destructiveness* — a findings engine that creates duplicates on
+every run, or silently churns `updated_at`/loses `first_detected_at` on
+reactivation, would be actively misleading for exactly the review workflow
+it exists to support. Confirming zero duplicates and zero unnecessary
+churn on a second full-production evaluation, and confirming the sandbox
+lifecycle sequence preserves finding identity and detection history
+through a full resolve → reactivate cycle, is direct evidence the
+reconciliation rules in `docs/DATABASE.md` are correct in practice. The
+production rule counts also being independently plausible (corroborating
+overlaps between `no_video_track` and `suspiciously_small_media` on the
+same broken files, zero false positives elsewhere) is evidence the rule
+engine surfaces real, actionable conditions rather than noise.
+
+This milestone remains entirely read-only against the NAS and Plex: no
+file operations, no identification, no automation. It demonstrates that
+the canonical inventory can now be reviewed for actionable conditions
+without any risk to the underlying media.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.

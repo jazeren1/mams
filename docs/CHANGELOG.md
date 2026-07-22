@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+Added a read-only findings engine: `mams findings evaluate` runs nine
+deterministic rules (`missing_file`, `metadata_error`,
+`metadata_not_probed`, `unknown_layout`, `zero_byte_file`,
+`suspiciously_small_media`, `no_video_track`, `no_audio_track`,
+`unexpected_extension`) against the canonical inventory and persists the
+results to a new `findings` table, reconciling in place rather than
+reinserting — repeated evaluation against unchanged inventory produces no
+duplicate findings, preserves each finding's id and original detection
+time, and only touches `updated_at` when a finding's content actually
+changed. A condition that disappears resolves its finding; one that
+reappears reactivates it, preserving `first_detected_at`. `mams findings
+list/stats/show` provide read-only browsing, filtering, and detail lookup.
+
+This milestone is entirely read-only against the NAS and Plex: it only
+reads already-collected inventory data and writes to the new `findings`
+table. No file operations, no identification, no automation.
+
 ## 0.3.1
 
 Fixed a severe (~100x) `mediainfo` invocation slowdown on macOS: capturing
