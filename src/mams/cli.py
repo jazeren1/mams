@@ -9,6 +9,8 @@ from .db import DEFAULT_MIGRATIONS_DIR, connect, migrate
 from . import inventory
 from . import inventory_repository
 from . import mediainfo
+from . import findings_repository
+from . import findings_service
 console = Console()
 
 DEFAULT_INVENTORY_REPORT = "reports/library.json"
@@ -88,6 +90,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diff_parser.add_argument("--category", default=None)
     diff_parser.add_argument("--json", action="store_true")
+
+    findings_parser = subs.add_parser("findings")
+    findings_subs = findings_parser.add_subparsers(dest="findings_command", required=True)
+
+    evaluate_findings_parser = findings_subs.add_parser(
+        "evaluate",
+        help="Evaluate findings rules against the current inventory and persist results. "
+        "Writes only to the findings table; never touches the NAS.",
+    )
+    evaluate_findings_parser.add_argument("--json", action="store_true")
+
+    list_findings_parser = findings_subs.add_parser("list", help="List findings. Read-only.")
+    list_findings_parser.add_argument(
+        "--status", type=str.upper, choices=["ACTIVE", "RESOLVED", "IGNORED"], default=None
+    )
+    list_findings_parser.add_argument(
+        "--severity", type=str.upper, choices=["INFO", "WARNING", "ERROR", "CRITICAL"], default=None
+    )
+    list_findings_parser.add_argument("--rule", dest="rule_code", default=None)
+    list_findings_parser.add_argument("--category", default=None)
+    list_findings_parser.add_argument("--limit", type=int, default=None)
+    list_findings_parser.add_argument("--json", action="store_true")
+
+    stats_findings_parser = findings_subs.add_parser("stats", help="Show findings statistics. Read-only.")
+    stats_findings_parser.add_argument("--json", action="store_true")
+
+    show_findings_parser = findings_subs.add_parser("show", help="Show details for a single finding. Read-only.")
+    show_findings_parser.add_argument("finding_id", type=int)
+    show_findings_parser.add_argument("--json", action="store_true")
 
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
@@ -459,6 +490,164 @@ def run_inventory_diff(
     return result
 
 
+def run_findings_evaluate(
+    config: AppConfig, *, json_output: bool = False
+) -> findings_repository.ReconciliationResult:
+    """Evaluate all findings rules against the current canonical inventory
+    and persist the reconciled results. Writes only to the findings table;
+    never touches the NAS or any other table. Applies pending migrations
+    first, same as the inventory query commands."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        result = findings_service.evaluate_findings(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=result.to_dict())
+    else:
+        console.print(_render_findings_evaluate_text(result))
+    return result
+
+
+def _render_findings_evaluate_text(result: findings_repository.ReconciliationResult) -> str:
+    lines = ["MAMS Findings Evaluation", "=" * 24, ""]
+    lines.append(f"Created:     {result.created}")
+    lines.append(f"Reactivated: {result.reactivated}")
+    lines.append(f"Updated:     {result.updated}")
+    lines.append(f"Unchanged:   {result.unchanged}")
+    lines.append(f"Resolved:    {result.resolved}")
+    if result.ignored_touched:
+        lines.append(f"Ignored (preserved): {result.ignored_touched}")
+    return "\n".join(lines)
+
+
+def _finding_path(record: findings_repository.FindingRecord) -> str:
+    if record.category is not None and record.relative_path is not None:
+        return f"{record.category}/{record.relative_path}"
+    return record.absolute_path or "(file no longer resolvable)"
+
+
+def _render_findings_list_text(records: list[findings_repository.FindingRecord]) -> str:
+    if not records:
+        return "No matching findings."
+    lines = [f"{len(records)} finding(s)", ""]
+    lines.append(f"{'SEVERITY':<9} {'RULE':<26} {'CATEGORY':<10} PATH")
+    for record in records:
+        lines.append(
+            f"{record.severity:<9} {record.rule_code:<26} {(record.category or '?'):<10} {_finding_path(record)}"
+        )
+    return "\n".join(lines)
+
+
+def run_findings_list(
+    config: AppConfig,
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+    rule_code: str | None = None,
+    category: str | None = None,
+    limit: int | None = None,
+    json_output: bool = False,
+) -> list[findings_repository.FindingRecord]:
+    """List findings rows from the database. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        records = findings_repository.list_findings(
+            connection, status=status, severity=severity, rule_code=rule_code, category=category, limit=limit
+        )
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[record.to_dict() for record in records])
+    else:
+        console.print(_render_findings_list_text(records))
+    return records
+
+
+def _render_findings_stats_text(stats: findings_repository.FindingsStats) -> str:
+    lines = ["MAMS Findings Statistics", "=" * 24, ""]
+    lines.append(f"Total:    {stats.total_count}")
+    lines.append(f"Active:   {stats.active_count}")
+    lines.append(f"Resolved: {stats.resolved_count}")
+    lines.append(f"Ignored:  {stats.ignored_count}")
+    lines.append("")
+    lines.append(
+        "By severity (active): "
+        + (", ".join(f"{k}={v}" for k, v in sorted(stats.severity_counts.items())) or "none")
+    )
+    lines.append(
+        "By rule (active):     " + (", ".join(f"{k}={v}" for k, v in sorted(stats.rule_counts.items())) or "none")
+    )
+    return "\n".join(lines)
+
+
+def run_findings_stats(config: AppConfig, *, json_output: bool = False) -> findings_repository.FindingsStats:
+    """Show current findings statistics. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        stats = findings_repository.get_findings_stats(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=stats.to_dict())
+    else:
+        console.print(_render_findings_stats_text(stats))
+    return stats
+
+
+def _render_finding_text(record: findings_repository.FindingRecord) -> str:
+    lines = [f"Finding #{record.id}", "=" * len(f"Finding #{record.id}")]
+    lines.append(f"Status:   {record.status}")
+    lines.append(f"Severity: {record.severity}")
+    lines.append(f"Rule:     {record.rule_code}")
+    lines.append(f"Path:     {_finding_path(record)}")
+    lines.append("")
+    lines.append(f"Summary: {record.summary}")
+    if record.evidence:
+        lines.append("")
+        lines.append("Evidence:")
+        for key, value in sorted(record.evidence.items()):
+            lines.append(f"  {key}: {value}")
+    if record.recommendation:
+        lines.append("")
+        lines.append(f"Recommendation: {record.recommendation}")
+    lines.append("")
+    lines.append(f"First detected: {record.first_detected_at}")
+    lines.append(f"Last detected:  {record.last_detected_at}")
+    if record.resolved_at:
+        lines.append(f"Resolved:       {record.resolved_at}")
+    return "\n".join(lines)
+
+
+def run_findings_show(
+    config: AppConfig, finding_id: int, *, json_output: bool = False
+) -> findings_repository.FindingRecord | None:
+    """Show details for a single finding. Read-only. Returns None (after
+    printing a clear error, never mutating anything) for an unknown id."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        record = findings_repository.get_finding(connection, finding_id)
+    finally:
+        connection.close()
+
+    if record is None:
+        console.print(f"[red]Finding {finding_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=record.to_dict())
+    else:
+        console.print(_render_finding_text(record))
+    return record
+
+
 def run_mediainfo(path: str, *, json_output: bool) -> mediainfo.MediaInfoOutcome:
     """Diagnostic command: parse and display MediaInfo for a single file.
 
@@ -527,6 +716,23 @@ def main() -> None:
                 category=args.category,
                 json_output=args.json,
             )
+    elif args.command == "findings":
+        if args.findings_command == "evaluate":
+            run_findings_evaluate(config, json_output=args.json)
+        elif args.findings_command == "list":
+            run_findings_list(
+                config,
+                status=args.status,
+                severity=args.severity,
+                rule_code=args.rule_code,
+                category=args.category,
+                limit=args.limit,
+                json_output=args.json,
+            )
+        elif args.findings_command == "stats":
+            run_findings_stats(config, json_output=args.json)
+        elif args.findings_command == "show":
+            run_findings_show(config, args.finding_id, json_output=args.json)
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 
