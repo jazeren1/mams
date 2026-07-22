@@ -239,3 +239,197 @@ def reconcile_findings(connection: sqlite3.Connection, candidates: list[FindingC
         resolved=resolved,
         ignored_touched=ignored_touched,
     )
+
+
+# --- query layer (list / get / stats) ---------------------------------------
+#
+# Read-only access for `mams findings list/show/stats`. Every function here
+# runs a fixed, small number of queries regardless of how many findings
+# rows match -- never one query per row. Path/category are resolved via
+# LEFT JOIN at read time (never stored on findings -- see docs/DATABASE.md),
+# the same pattern scan_changes uses for category.
+
+
+def _case_rank_sql(column: str, order: dict[str, int]) -> str:
+    """A CASE expression ranking `column`'s values by `order`, for a stable
+    ORDER BY that doesn't match SQL's default alphabetical text ordering.
+    `order`'s keys are this module's own fixed constants, never external
+    input, so direct interpolation into the SQL text is safe."""
+    cases = " ".join(f"WHEN '{value}' THEN {rank}" for value, rank in order.items())
+    return f"CASE {column} {cases} ELSE {len(order)} END"
+
+
+_SEVERITY_RANK_SQL = _case_rank_sql("findings.severity", _SEVERITY_ORDER)
+_RULE_RANK_SQL = _case_rank_sql("findings.rule_code", _RULE_ORDER)
+
+_FINDING_BASE_SELECT = f"""
+    SELECT
+        findings.*,
+        libraries.category AS category,
+        media_files.absolute_path AS absolute_path,
+        media_files.relative_path AS relative_path,
+        {_SEVERITY_RANK_SQL} AS severity_rank,
+        {_RULE_RANK_SQL} AS rule_rank
+    FROM findings
+    LEFT JOIN libraries ON libraries.id = findings.library_id
+    LEFT JOIN media_files ON media_files.id = findings.media_file_id
+"""
+
+_FINDING_ORDER_BY = """
+    ORDER BY
+        COALESCE(libraries.category, ''),
+        COALESCE(media_files.relative_path, ''),
+        severity_rank,
+        rule_rank,
+        findings.id
+"""
+
+
+@dataclass(frozen=True)
+class FindingRecord:
+    """One findings row, with category/path resolved via join and
+    evidence_json parsed back into a dict."""
+
+    id: int
+    rule_code: str
+    severity: str
+    status: str
+    media_file_id: int | None
+    library_id: int | None
+    category: str | None
+    absolute_path: str | None
+    relative_path: str | None
+    summary: str
+    evidence: dict[str, object] | None
+    recommendation: str | None
+    first_detected_at: str
+    last_detected_at: str
+    resolved_at: str | None
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FindingsStats:
+    total_count: int
+    active_count: int
+    resolved_count: int
+    ignored_count: int
+    severity_counts: dict[str, int]
+    rule_counts: dict[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _row_to_finding_record(row: sqlite3.Row) -> FindingRecord:
+    evidence = json.loads(row["evidence_json"]) if row["evidence_json"] is not None else None
+    return FindingRecord(
+        id=row["id"],
+        rule_code=row["rule_code"],
+        severity=row["severity"],
+        status=row["status"],
+        media_file_id=row["media_file_id"],
+        library_id=row["library_id"],
+        category=row["category"],
+        absolute_path=row["absolute_path"],
+        relative_path=row["relative_path"],
+        summary=row["summary"],
+        evidence=evidence,
+        recommendation=row["recommendation"],
+        first_detected_at=row["first_detected_at"],
+        last_detected_at=row["last_detected_at"],
+        resolved_at=row["resolved_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def list_findings(
+    connection: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+    rule_code: str | None = None,
+    category: str | None = None,
+    media_file_id: int | None = None,
+    limit: int | None = None,
+) -> list[FindingRecord]:
+    """List findings rows for browsing, with deterministic ordering.
+
+    All filters are optional and combined with AND. Ordered by (category,
+    relative_path, severity rank, rule rank, id): findings are grouped by
+    the file they concern, then by severity (CRITICAL first), then by the
+    rules' declared order in findings.ALL_RULES -- stable regardless of
+    insertion order. Single query with two LEFT JOINs, never one query per
+    row.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if status is not None:
+        clauses.append("findings.status = ?")
+        params.append(status)
+    if severity is not None:
+        clauses.append("findings.severity = ?")
+        params.append(severity)
+    if rule_code is not None:
+        clauses.append("findings.rule_code = ?")
+        params.append(rule_code)
+    if category is not None:
+        clauses.append("libraries.category = ?")
+        params.append(category)
+    if media_file_id is not None:
+        clauses.append("findings.media_file_id = ?")
+        params.append(media_file_id)
+
+    sql = _FINDING_BASE_SELECT
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += _FINDING_ORDER_BY
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    rows = connection.execute(sql, params).fetchall()
+    return [_row_to_finding_record(row) for row in rows]
+
+
+def get_finding(connection: sqlite3.Connection, finding_id: int) -> FindingRecord | None:
+    """Look up a single finding by id, or None if it doesn't exist."""
+    sql = _FINDING_BASE_SELECT + " WHERE findings.id = ?"
+    row = connection.execute(sql, (finding_id,)).fetchone()
+    return _row_to_finding_record(row) if row is not None else None
+
+
+def get_findings_stats(connection: sqlite3.Connection) -> FindingsStats:
+    """Aggregate findings statistics in three fixed queries, none of them
+    per-row: counts by status, and (ACTIVE findings only) counts by
+    severity and by rule_code."""
+    status_counts = {
+        row["status"]: row["n"]
+        for row in connection.execute("SELECT status, COUNT(*) AS n FROM findings GROUP BY status").fetchall()
+    }
+    severity_counts = {
+        row["severity"]: row["n"]
+        for row in connection.execute(
+            "SELECT severity, COUNT(*) AS n FROM findings WHERE status = 'ACTIVE' GROUP BY severity"
+        ).fetchall()
+    }
+    rule_counts = {
+        row["rule_code"]: row["n"]
+        for row in connection.execute(
+            "SELECT rule_code, COUNT(*) AS n FROM findings WHERE status = 'ACTIVE' GROUP BY rule_code"
+        ).fetchall()
+    }
+
+    return FindingsStats(
+        total_count=sum(status_counts.values()),
+        active_count=status_counts.get("ACTIVE", 0),
+        resolved_count=status_counts.get("RESOLVED", 0),
+        ignored_count=status_counts.get("IGNORED", 0),
+        severity_counts=severity_counts,
+        rule_counts=rule_counts,
+    )
