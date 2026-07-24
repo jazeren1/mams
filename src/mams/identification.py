@@ -398,3 +398,227 @@ def _parse_movie(input_data: IdentificationInput) -> IdentificationCandidate:
         edition=edition,
         part_number=part_number,
     )
+
+
+# --- television parsing --------------------------------------------------------
+
+# S01E02, s01e02 (IGNORECASE), S01E02E03, S01E02-E03 -- the trailing group
+# accepts zero or more "[-]?E\d+" repeats, so both the back-to-back and
+# hyphenated multi-episode forms match as one span.
+_SXXEXX_PATTERN = re.compile(r"S(?P<season>\d{1,2})E(?P<ep1>\d{1,3})(?:[-]?E\d{1,3})*", re.IGNORECASE)
+# Extracts every E<digits> group from a matched SxxExx span, in order --
+# used instead of parsing named groups individually so back-to-back and
+# hyphenated forms share one code path.
+_MULTI_EPISODE_PATTERN = re.compile(r"E(\d{1,3})", re.IGNORECASE)
+
+# 1x02. Bounded to 1-2 season digits and (?<!\d)/(?!\d) on both sides so
+# this doesn't fire inside an unrelated longer digit run (e.g. a
+# resolution like "1920x1080").
+_NXNN_PATTERN = re.compile(r"(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)", re.IGNORECASE)
+
+# "Season 01 Episode 02" and dot/underscore/dash-separated variants of it.
+_SEASON_EPISODE_WORDS_PATTERN = re.compile(
+    r"season[\s._-]*(\d{1,2})[\s._-]*episode[\s._-]*(\d{1,3})", re.IGNORECASE
+)
+
+# A season-folder name on its own, e.g. "Season 01" -- season number only,
+# no episode evidence. Same shape as inventory._SEASON_DIR_PATTERN.
+_SEASON_FOLDER_PATTERN = re.compile(r"^season[\s_-]*(\d{1,2})$", re.IGNORECASE)
+
+# Bonus/non-episode content recognized by keyword rather than a numbered
+# pattern. Longer, more specific phrases are listed before the generic
+# "extra"/"extras" catch-all.
+_EXTRA_KEYWORD_CANONICAL: dict[str, str] = {
+    "behind the scenes": "behind_the_scenes",
+    "deleted scenes": "deleted_scene",
+    "deleted scene": "deleted_scene",
+    "gag reel": "gag_reel",
+    "bloopers": "bloopers",
+    "featurette": "featurette",
+    "interview": "interview",
+    "trailer": "trailer",
+    "extras": "extra",
+    "extra": "extra",
+}
+_EXTRA_KEYWORD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _EXTRA_KEYWORD_CANONICAL) + r")\b", re.IGNORECASE
+)
+
+
+@dataclass(frozen=True)
+class _SeasonEpisodeMatch:
+    pattern: str
+    match: re.Match[str]
+    season: int
+    episodes: tuple[int, ...]
+
+
+def _search_season_episode(text: str) -> _SeasonEpisodeMatch | None:
+    """Try each supported filename season/episode pattern in priority
+    order (SxxExx, then "Season N Episode M" words, then NxNN), returning
+    the first that matches. Filename evidence only -- season-folder
+    evidence is applied separately by the caller, never here, so it can
+    never override a pattern actually present in the filename."""
+    sxxexx = _SXXEXX_PATTERN.search(text)
+    if sxxexx is not None:
+        episodes = tuple(int(n) for n in _MULTI_EPISODE_PATTERN.findall(sxxexx.group(0)))
+        return _SeasonEpisodeMatch("SxxExx", sxxexx, int(sxxexx.group("season")), episodes)
+
+    words = _SEASON_EPISODE_WORDS_PATTERN.search(text)
+    if words is not None:
+        return _SeasonEpisodeMatch("season_episode_words", words, int(words.group(1)), (int(words.group(2)),))
+
+    nxnn = _NXNN_PATTERN.search(text)
+    if nxnn is not None:
+        return _SeasonEpisodeMatch("NxNN", nxnn, int(nxnn.group(1)), (int(nxnn.group(2)),))
+
+    return None
+
+
+def _folder_season_number(parent_directory: str, layout: str) -> int | None:
+    """Season number from a "Season NN" parent directory -- only
+    meaningful for tv_season_folder layout, where the immediate parent is
+    the season folder itself."""
+    if layout != "tv_season_folder":
+        return None
+    match = _SEASON_FOLDER_PATTERN.match(Path(parent_directory).name.strip())
+    return int(match.group(1)) if match else None
+
+
+def _folder_series_title(input_data: IdentificationInput) -> str | None:
+    """Series title from directory structure: the series folder itself for
+    tv_series_folder, or its parent (the season folder's parent) for
+    tv_season_folder. None for any other layout -- there is no reliable
+    series-named directory to read."""
+    if input_data.layout == "tv_series_folder":
+        name = Path(input_data.parent_directory).name
+    elif input_data.layout == "tv_season_folder":
+        name = Path(input_data.parent_directory).parent.name
+    else:
+        return None
+    cleaned = _clean_release_text(name)
+    return cleaned.title if cleaned.title and not _is_ambiguous_title(cleaned.title) else None
+
+
+def _extra_candidate(
+    input_data: IdentificationInput, extra_match: re.Match[str], folder_series_title: str | None
+) -> IdentificationCandidate:
+    canonical = _EXTRA_KEYWORD_CANONICAL[extra_match.group(0).lower()]
+    evidence: dict[str, object] = {"pattern": "extra_keyword", "matched_text": extra_match.group(0)}
+    # MEDIUM when at least a series folder places the content, LOW when
+    # even that context is missing -- never higher, since bonus content
+    # has no episode identity to be confident about.
+    confidence = Confidence.MEDIUM if folder_series_title else Confidence.LOW
+    return IdentificationCandidate(
+        media_file_id=input_data.media_file_id,
+        candidate_type=CandidateType.EXTRA,
+        confidence=confidence,
+        parser_version=PARSER_VERSION,
+        evidence=evidence,
+        parsed_series_title=folder_series_title,
+        special_type=canonical,
+    )
+
+
+def _unknown_television_candidate(
+    input_data: IdentificationInput, folder_series_title: str | None, folder_season: int | None
+) -> IdentificationCandidate:
+    """No season/episode pattern and no extra-content keyword in the
+    filename -- insufficient evidence to classify. Any folder context is
+    recorded in evidence but never promoted into season_number/
+    episode_number: those stay unset rather than fabricated."""
+    evidence: dict[str, object] = {"pattern": None}
+    if folder_series_title is not None:
+        evidence["folder_series_title"] = folder_series_title
+    if folder_season is not None:
+        evidence["folder_season"] = folder_season
+    return IdentificationCandidate(
+        media_file_id=input_data.media_file_id,
+        candidate_type=CandidateType.UNKNOWN,
+        confidence=Confidence.UNKNOWN,
+        parser_version=PARSER_VERSION,
+        evidence=evidence,
+        parsed_series_title=folder_series_title,
+    )
+
+
+def _parse_television(input_data: IdentificationInput) -> IdentificationCandidate:
+    """Conservative TV season/episode parsing.
+
+    Filename evidence for season/episode numbers always takes precedence
+    over season-folder evidence -- the folder only fills in a series title
+    when the filename doesn't have one, or corroborates/conflicts with the
+    filename's season number, never overrides it.
+
+    Confidence rubric:
+    - HIGH: a season/episode pattern was found in the filename, and a
+      series title was found in the filename too (no folder dependency).
+    - MEDIUM: a season/episode pattern was found in the filename, but the
+      series title came from folder context instead.
+    - LOW: the filename's season number conflicts with its season-folder
+      directory, or no series title could be found anywhere; also used for
+      EXTRA candidates with no folder context to place them.
+    - UNKNOWN: no season/episode pattern and no recognized extra-content
+      keyword anywhere in the filename.
+    """
+    filename_stem = _strip_extension(input_data.filename)
+    match_result = _search_season_episode(filename_stem)
+    folder_season = _folder_season_number(input_data.parent_directory, input_data.layout)
+    folder_series_title = _folder_series_title(input_data)
+
+    if match_result is None:
+        extra_match = _EXTRA_KEYWORD_PATTERN.search(filename_stem)
+        if extra_match is not None:
+            return _extra_candidate(input_data, extra_match, folder_series_title)
+        return _unknown_television_candidate(input_data, folder_series_title, folder_season)
+
+    series_raw = filename_stem[: match_result.match.start()]
+    episode_title_raw = filename_stem[match_result.match.end() :]
+    series_clean = _clean_release_text(series_raw)
+    episode_clean = _clean_release_text(episode_title_raw)
+
+    series_has_title = bool(series_clean.title) and not _is_ambiguous_title(series_clean.title)
+    if series_has_title:
+        series_title, title_source = series_clean.title, "filename"
+    elif folder_series_title is not None:
+        series_title, title_source = folder_series_title, "parent_directory"
+    else:
+        series_title, title_source = None, None
+
+    episode_title = (
+        episode_clean.title if episode_clean.title and not _is_ambiguous_title(episode_clean.title) else None
+    )
+
+    season_conflict = folder_season is not None and folder_season != match_result.season
+    is_special = match_result.season == 0
+
+    if series_title is None or season_conflict:
+        confidence = Confidence.LOW
+    elif title_source == "filename":
+        confidence = Confidence.HIGH
+    else:
+        confidence = Confidence.MEDIUM
+
+    evidence: dict[str, object] = {
+        "pattern": match_result.pattern,
+        "matched_text": match_result.match.group(0),
+        "series_title_source": title_source,
+        "filename_season": match_result.season,
+        "folder_season": folder_season,
+    }
+    if season_conflict:
+        evidence["conflict"] = "season_mismatch_between_filename_and_season_folder"
+
+    return IdentificationCandidate(
+        media_file_id=input_data.media_file_id,
+        candidate_type=CandidateType.SPECIAL if is_special else CandidateType.EPISODE,
+        confidence=confidence,
+        parser_version=PARSER_VERSION,
+        evidence=evidence,
+        parsed_series_title=series_title,
+        season_number=match_result.season,
+        episode_number=match_result.episodes[0] if match_result.episodes else None,
+        episode_numbers=match_result.episodes,
+        episode_title=episode_title,
+        special_type="season_zero" if is_special else None,
+    )
