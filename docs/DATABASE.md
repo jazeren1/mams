@@ -14,6 +14,11 @@ layers of tables:
   evaluating the canonical inventory (missing files, metadata errors,
   zero-byte files, and similar), persisted and reconciled by `mams
   findings evaluate`. See "`findings`" below.
+- **Identification candidates** (`identification_candidates`): local,
+  deterministic parses of each file's path/filename into a structured but
+  unconfirmed movie or TV interpretation, persisted and reconciled by
+  `mams identify evaluate`. Never calls TMDb/TVDB/Plex or any external
+  service. See "`identification_candidates`" below.
 
 Schema changes are versioned migrations under `database/migrations/`, never
 applied by hand to a deployed database. See "Migration strategy" below.
@@ -52,6 +57,8 @@ libraries (0..1) ─────< scan_changes (N)       [library_id, ON DELETE 
 
 media_files (0..1) ──< findings (N)            [media_file_id, ON DELETE SET NULL]
 libraries (0..1) ─────< findings (N)           [library_id, ON DELETE SET NULL]
+
+media_files (1) ──< identification_candidates (0..1)  [media_file_id, ON DELETE CASCADE]
 
 [future, not this milestone] media_files (N) >─── (1) assets
 ```
@@ -379,6 +386,146 @@ findings history the moment its subject disappeared — exactly backwards
 for a record whose entire purpose is surfacing problems for a human to
 review.
 
+### `identification_candidates`
+
+One row per `ACTIVE` media file, holding the current deterministic parse of
+its path/filename into a structured movie or TV interpretation.
+Reconciled — not reinserted — by every `mams identify evaluate` run,
+exactly like `findings`. This is a read-only-against-the-NAS engine: it
+only reads `media_files` and writes `identification_candidates`; it never
+calls TMDb, TVDB, Plex, or any other external service. **A candidate is a
+local interpretation of evidence, never a confirmed media identity** — the
+schema and every CLI surface deliberately avoid language ("identified as",
+"matched") that would suggest otherwise.
+
+```sql
+CREATE TABLE identification_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_file_id INTEGER NOT NULL UNIQUE REFERENCES media_files(id) ON DELETE CASCADE,
+    candidate_type TEXT NOT NULL CHECK (candidate_type IN ('MOVIE','EPISODE','SPECIAL','EXTRA','UNKNOWN')),
+    parsed_title TEXT,
+    parsed_year INTEGER,
+    parsed_series_title TEXT,
+    season_number INTEGER,
+    episode_number INTEGER,
+    episode_numbers_json TEXT,
+    episode_title TEXT,
+    edition TEXT,
+    part_number INTEGER,
+    special_type TEXT,
+    confidence TEXT NOT NULL CHECK (confidence IN ('HIGH','MEDIUM','LOW','UNKNOWN')),
+    parser_version INTEGER NOT NULL,
+    evidence_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Identity/uniqueness.** `UNIQUE(media_file_id)`, enforced by
+`idx_identification_candidates_media_file_id`. Unlike `findings`
+(`UNIQUE(rule_code, media_file_id)` — many rules can each hold a row per
+file), a file has exactly one *current* candidate. A re-parse (the file's
+path, filename, or layout changed since the last evaluation, or
+`parser_version` advanced) replaces that row's content in place; it never
+accumulates a second row for the same file.
+
+**FK retention: `ON DELETE CASCADE`, deliberately not `SET NULL`.** This is
+the one place this schema's FK convention differs from `scan_changes` and
+`findings`. Those two exist specifically to be *historical evidence that
+outlives its subject* — a `scan_changes` row documents "this happened," a
+`findings` row documents "this condition was observed" — so both use
+`ON DELETE SET NULL` to survive a future `media_files` delete. A candidate
+is the opposite kind of thing: it is not a record that something happened,
+it is *the current interpretation of a file that still exists*, discarded
+and reparsed the instant that file's path changes. An interpretation of a
+file that has been deleted describes nothing, so `ON DELETE CASCADE`
+removes the candidate along with the file it interprets. (Nothing deletes
+`media_files` rows today — a missing file is a `state` flip, not a
+delete — so this is a documented future-proofing choice, not a live
+behavior difference; see the "identification_candidates lifecycle"
+section below for what actually happens on the state flip that *does*
+happen today.)
+
+**Column notes:**
+
+- `candidate_type` — `MOVIE`, `EPISODE`, `SPECIAL` (season 0 / explicit
+  special evidence), `EXTRA` (bonus/deleted-scene/featurette content, not
+  a numbered episode), or `UNKNOWN` (insufficient evidence to classify).
+- `parsed_title` / `parsed_year` — movie fields; `NULL` for
+  `EPISODE`/`SPECIAL` candidates.
+- `parsed_series_title` / `season_number` / `episode_number` /
+  `episode_numbers_json` / `episode_title` — TV fields; `NULL` for `MOVIE`
+  candidates. `episode_number` holds the first/primary episode number for
+  simple filtering and display; `episode_numbers_json` holds the full
+  ordered list (as a compact JSON array, e.g. `[2,3]`) for multi-episode
+  files (`S01E02E03`, `S01E02-E03`). For a single-episode file the two are
+  redundant by construction (`episode_numbers_json` is always `[episode_number]`)
+  — accepted duplication, not drift, because "the primary episode number"
+  needs to be a plain queryable/sortable column (see the query layer
+  below) and "all episode numbers" needs to preserve the full list; there
+  is no third representation to keep in sync.
+- `edition` / `part_number` — movie fields for conservatively recognized
+  edition labels (e.g. `"Director's Cut"`) and part/disc markers.
+- `special_type` — set only for `SPECIAL`/`EXTRA` candidates when the
+  filename gives a specific classification (e.g. `"behind the scenes"`,
+  `"deleted scene"`); `NULL` when the type is known but the specific kind
+  isn't.
+- `confidence` — see "Confidence rubric" in `src/mams/identification.py`;
+  never `HIGH` merely because a file lives in a movie/TV category
+  directory — it reflects the strength of the *parsed* evidence.
+- `parser_version` — an integer bumped whenever parsing logic changes
+  meaningfully, so a future `mams identify evaluate` run can detect and
+  re-evaluate candidates parsed by an older version. Not currently read by
+  reconciliation to force a re-parse (every `evaluate` run re-parses every
+  `ACTIVE` file unconditionally, so a version bump takes effect on the very
+  next run) — it exists purely as an audit trail on each row: "which
+  parser produced this."
+- `evidence_json`. `NULL` only if no candidate was produced (never — a
+  candidate row is always written, at minimum `UNKNOWN`); otherwise a
+  compact, deterministic encoding (`json.dumps(..., sort_keys=True,
+  separators=(",", ":"))`, same convention as `findings.evidence_json`)
+  recording *how* the parse was derived: which evidence source each field
+  came from (`"title_source": "filename"` vs `"parent_directory"`), the
+  specific substrings matched (e.g. the raw `"(1979)"` or `"S01E02"`
+  match), and the technical tokens stripped from the raw name (e.g.
+  `["1080p", "BluRay", "x264"]`). Deliberately **not** a duplicate of the
+  `media_files` row — it never repeats the full filename/path already on
+  that row, only the parsing-specific facts a human would need to audit
+  *why* this candidate looks the way it does.
+
+## `identification_candidates` lifecycle
+
+`identification_service.evaluate_candidates()` loads every `ACTIVE`
+`media_files` row (via `inventory_repository.list_media_files(state="ACTIVE")`),
+parses each one exactly once (`identification.evaluate_file()` — pure, no
+SQL), and reconciles the results into `identification_candidates`, keyed
+by `media_file_id`:
+
+- **`ACTIVE` file with no existing candidate row** → INSERT. `created_at`
+  and `updated_at` both start at `CURRENT_TIMESTAMP`.
+- **`ACTIVE` file with an existing row whose parsed content is
+  unchanged** → left untouched entirely (no `UPDATE` statement at all), so
+  `id`, `created_at`, and `updated_at` are all stable and a repeated
+  evaluation against an unchanged inventory produces zero writes for that
+  file.
+- **`ACTIVE` file with an existing row whose parsed content differs**
+  (the file's path/filename/layout changed since the last evaluation, or
+  the parser now produces a different result) → UPDATE every content
+  column plus `updated_at`, preserving `id` and `created_at`.
+- **`MISSING` file** → never visited by `evaluate_candidates()` at all
+  (it only queries `state='ACTIVE'`). Any existing candidate for that file
+  is left exactly as it was — this is the simplest of the three lifecycle
+  options considered (remove / mark inactive / retain untouched) and
+  requires no special-case code: retaining the last interpretation is
+  also the most useful default for a future external-identity-resolution
+  milestone, since a file that goes `MISSING` and is later `RESTORED`
+  keeps its candidate the whole time.
+
+Reconciliation runs inside one transaction
+(`with connection:` in `identification_service.evaluate_candidates`, the
+same pattern as `findings_service.evaluate_findings`); an exception
+partway through rolls back every write made so far.
+
 ## Findings lifecycle
 
 `findings_repository.reconcile_findings()` is given every `FindingCandidate`
@@ -458,6 +605,11 @@ natural/business keys, enforced via `UNIQUE`.
   `findings.library_id → libraries.id` (`ON DELETE SET NULL` — same
   "evidence must outlive its subject" reasoning as `scan_changes`. See
   "`findings`" above.)
+- `identification_candidates.media_file_id → media_files.id`
+  (`ON DELETE CASCADE` — the opposite reasoning from `scan_changes`/
+  `findings`: a candidate is a live interpretation of a still-existing
+  file, not evidence that must outlive it. See "`identification_candidates`"
+  above.)
 
 Nothing yet references `discs`/`assets`/`files`/`jobs`/`replacements` —
 that linkage (a nullable `asset_id` on `media_files`, or a join table for
@@ -496,6 +648,12 @@ CREATE INDEX idx_findings_severity ON findings(severity);
 CREATE INDEX idx_findings_rule_code ON findings(rule_code);
 CREATE INDEX idx_findings_media_file_id ON findings(media_file_id);
 CREATE INDEX idx_findings_library_id ON findings(library_id);
+
+CREATE UNIQUE INDEX idx_identification_candidates_media_file_id ON identification_candidates(media_file_id);
+CREATE INDEX idx_identification_candidates_type ON identification_candidates(candidate_type);
+CREATE INDEX idx_identification_candidates_confidence ON identification_candidates(confidence);
+CREATE INDEX idx_identification_candidates_season_number ON identification_candidates(season_number);
+CREATE INDEX idx_identification_candidates_parsed_year ON identification_candidates(parsed_year);
 ```
 
 ## Migration strategy
@@ -512,6 +670,8 @@ Numbered, forward-only SQL files under `database/migrations/`:
 - `0004_findings.sql` — `findings` and its indexes. Unlike `0003`, every
   statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so this migration is
   fully retry-safe with no narrow-window caveat.
+- `0005_identification_candidates.sql` — `identification_candidates` and
+  its indexes. Also fully `IF NOT EXISTS`, retry-safe like `0004`.
 
 `schema_version` tracks the highest applied migration number. A migration
 runner applies any file numbered above the current version, in order,
