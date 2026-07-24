@@ -11,6 +11,8 @@ from . import inventory_repository
 from . import mediainfo
 from . import findings_repository
 from . import findings_service
+from . import identification_repository
+from . import identification_service
 console = Console()
 
 DEFAULT_INVENTORY_REPORT = "reports/library.json"
@@ -119,6 +121,41 @@ def build_parser() -> argparse.ArgumentParser:
     show_findings_parser = findings_subs.add_parser("show", help="Show details for a single finding. Read-only.")
     show_findings_parser.add_argument("finding_id", type=int)
     show_findings_parser.add_argument("--json", action="store_true")
+
+    identify_parser = subs.add_parser("identify")
+    identify_subs = identify_parser.add_subparsers(dest="identify_command", required=True)
+
+    evaluate_identify_parser = identify_subs.add_parser(
+        "evaluate",
+        help="Parse local identification candidates for every ACTIVE media file and persist results. "
+        "Local interpretation only -- never calls TMDb/TVDB/Plex or any external service.",
+    )
+    evaluate_identify_parser.add_argument("--json", action="store_true")
+
+    list_identify_parser = identify_subs.add_parser(
+        "list", help="List identification candidates. Read-only; parsed interpretations, not confirmed identities."
+    )
+    list_identify_parser.add_argument(
+        "--type", dest="candidate_type", type=str.upper,
+        choices=["MOVIE", "EPISODE", "SPECIAL", "EXTRA", "UNKNOWN"], default=None,
+    )
+    list_identify_parser.add_argument(
+        "--confidence", type=str.upper, choices=["HIGH", "MEDIUM", "LOW", "UNKNOWN"], default=None
+    )
+    list_identify_parser.add_argument("--category", default=None)
+    list_identify_parser.add_argument("--limit", type=int, default=None)
+    list_identify_parser.add_argument("--json", action="store_true")
+
+    stats_identify_parser = identify_subs.add_parser(
+        "stats", help="Show identification candidate statistics. Read-only."
+    )
+    stats_identify_parser.add_argument("--json", action="store_true")
+
+    show_identify_parser = identify_subs.add_parser(
+        "show", help="Show details for a single identification candidate. Read-only."
+    )
+    show_identify_parser.add_argument("candidate_id", type=int)
+    show_identify_parser.add_argument("--json", action="store_true")
 
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
@@ -648,6 +685,184 @@ def run_findings_show(
     return record
 
 
+def run_identify_evaluate(
+    config: AppConfig, *, json_output: bool = False
+) -> identification_repository.ReconciliationResult:
+    """Parse local identification candidates for every ACTIVE media file
+    and persist the reconciled results. Writes only to the
+    identification_candidates table; never calls TMDb/TVDB/Plex or any
+    other external service. Applies pending migrations first, same as
+    `mams findings evaluate`."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        result = identification_service.evaluate_candidates(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=result.to_dict())
+    else:
+        console.print(_render_identify_evaluate_text(result))
+    return result
+
+
+def _render_identify_evaluate_text(result: identification_repository.ReconciliationResult) -> str:
+    lines = ["MAMS Identification Evaluation", "=" * 30, ""]
+    lines.append(f"Created:   {result.created}")
+    lines.append(f"Updated:   {result.updated}")
+    lines.append(f"Unchanged: {result.unchanged}")
+    return "\n".join(lines)
+
+
+def _parsed_identity(record: identification_repository.CandidateRecord) -> str:
+    """A human-readable rendering of a candidate's parsed fields --
+    deliberately never called "identity"/"identified" in isolation; every
+    surface that shows this string labels it PARSED IDENTITY, not a
+    confirmed one."""
+    if record.candidate_type == "MOVIE":
+        if record.parsed_title is None:
+            return "(unparsed)"
+        if record.parsed_year is not None:
+            return f"{record.parsed_title} ({record.parsed_year})"
+        return record.parsed_title
+    if record.candidate_type in ("EPISODE", "SPECIAL"):
+        series = record.parsed_series_title or "(unknown series)"
+        if record.season_number is None or not record.episode_numbers:
+            return series
+        episodes = "".join(f"E{n:02d}" for n in record.episode_numbers)
+        identity = f"{series} S{record.season_number:02d}{episodes}"
+        if record.episode_title:
+            identity += f" - {record.episode_title}"
+        return identity
+    if record.candidate_type == "EXTRA":
+        label = record.special_type or "extra"
+        return f"{record.parsed_series_title} {label}" if record.parsed_series_title else label
+    return record.parsed_title or "(unparsed)"
+
+
+def _render_identify_list_text(records: list[identification_repository.CandidateRecord]) -> str:
+    if not records:
+        return "No matching candidates."
+    lines = [f"{len(records)} candidate(s) -- parsed local interpretations, not confirmed identities", ""]
+    lines.append(f"{'CONFIDENCE':<10} {'TYPE':<9} {'CATEGORY':<10} {'PARSED IDENTITY':<32} PATH")
+    for record in records:
+        lines.append(
+            f"{record.confidence:<10} {record.candidate_type:<9} {record.category:<10} "
+            f"{_parsed_identity(record):<32} {record.category}/{record.relative_path}"
+        )
+    return "\n".join(lines)
+
+
+def run_identify_list(
+    config: AppConfig,
+    *,
+    candidate_type: str | None = None,
+    confidence: str | None = None,
+    category: str | None = None,
+    limit: int | None = None,
+    json_output: bool = False,
+) -> list[identification_repository.CandidateRecord]:
+    """List identification_candidates rows from the database. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        records = identification_repository.list_candidates(
+            connection, candidate_type=candidate_type, confidence=confidence, category=category, limit=limit
+        )
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[record.to_dict() for record in records])
+    else:
+        console.print(_render_identify_list_text(records))
+    return records
+
+
+def _render_identify_stats_text(stats: identification_repository.CandidateStats) -> str:
+    lines = ["MAMS Identification Statistics", "=" * 30, ""]
+    lines.append(f"Total: {stats.total_count}")
+    lines.append("")
+    lines.append("By type:       " + (", ".join(f"{k}={v}" for k, v in sorted(stats.type_counts.items())) or "none"))
+    lines.append(
+        "By confidence: " + (", ".join(f"{k}={v}" for k, v in sorted(stats.confidence_counts.items())) or "none")
+    )
+    lines.append("")
+    lines.append(f"With parsed year:    {stats.with_year_count}")
+    lines.append(f"Without parsed year: {stats.without_year_count}")
+    return "\n".join(lines)
+
+
+def run_identify_stats(config: AppConfig, *, json_output: bool = False) -> identification_repository.CandidateStats:
+    """Show current identification candidate statistics. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        stats = identification_repository.get_candidate_stats(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=stats.to_dict())
+    else:
+        console.print(_render_identify_stats_text(stats))
+    return stats
+
+
+def _render_identify_candidate_text(record: identification_repository.CandidateRecord) -> str:
+    lines = [f"Candidate #{record.id}", "=" * len(f"Candidate #{record.id}")]
+    lines.append("(a parsed local interpretation -- not a confirmed identity)")
+    lines.append("")
+    lines.append(f"Type:       {record.candidate_type}")
+    lines.append(f"Confidence: {record.confidence}")
+    lines.append(f"Path:       {record.category}/{record.relative_path}")
+    lines.append(f"Parsed:     {_parsed_identity(record)}")
+    lines.append("")
+    if record.candidate_type == "MOVIE":
+        if record.edition:
+            lines.append(f"Edition:      {record.edition}")
+        if record.part_number is not None:
+            lines.append(f"Part number:  {record.part_number}")
+    else:
+        if record.special_type:
+            lines.append(f"Special type: {record.special_type}")
+    if record.evidence:
+        lines.append("")
+        lines.append("Evidence:")
+        for key, value in sorted(record.evidence.items()):
+            lines.append(f"  {key}: {value}")
+    lines.append("")
+    lines.append(f"Parser version: {record.parser_version}")
+    lines.append(f"Created: {record.created_at}")
+    lines.append(f"Updated: {record.updated_at}")
+    return "\n".join(lines)
+
+
+def run_identify_show(
+    config: AppConfig, candidate_id: int, *, json_output: bool = False
+) -> identification_repository.CandidateRecord | None:
+    """Show details for a single identification candidate. Read-only.
+    Returns None (after printing a clear error, never mutating anything)
+    for an unknown id."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        record = identification_repository.get_candidate(connection, candidate_id)
+    finally:
+        connection.close()
+
+    if record is None:
+        console.print(f"[red]Candidate {candidate_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=record.to_dict())
+    else:
+        console.print(_render_identify_candidate_text(record))
+    return record
+
+
 def run_mediainfo(path: str, *, json_output: bool) -> mediainfo.MediaInfoOutcome:
     """Diagnostic command: parse and display MediaInfo for a single file.
 
@@ -733,6 +948,22 @@ def main() -> None:
             run_findings_stats(config, json_output=args.json)
         elif args.findings_command == "show":
             run_findings_show(config, args.finding_id, json_output=args.json)
+    elif args.command == "identify":
+        if args.identify_command == "evaluate":
+            run_identify_evaluate(config, json_output=args.json)
+        elif args.identify_command == "list":
+            run_identify_list(
+                config,
+                candidate_type=args.candidate_type,
+                confidence=args.confidence,
+                category=args.category,
+                limit=args.limit,
+                json_output=args.json,
+            )
+        elif args.identify_command == "stats":
+            run_identify_stats(config, json_output=args.json)
+        elif args.identify_command == "show":
+            run_identify_show(config, args.candidate_id, json_output=args.json)
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 
