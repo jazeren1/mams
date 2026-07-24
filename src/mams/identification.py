@@ -264,3 +264,137 @@ def _clean_release_text(raw: str) -> _CleanedRelease:
         part_number=part_number,
         removed_tokens=tuple(tokens),
     )
+
+
+# --- movie parsing ------------------------------------------------------------
+
+
+def _titles_similar(a: str, b: str) -> bool:
+    """Conservative equivalence check for two candidate titles: exact match
+    (case-insensitive) or one containing the other as a substring. Anything
+    looser risks false negatives on genuinely different titles; anything
+    stricter would flag "Alien" vs "alien" -- a mere casing difference --
+    as conflicting evidence, which it isn't."""
+    a_norm, b_norm = a.strip().lower(), b.strip().lower()
+    if not a_norm or not b_norm:
+        return True
+    return a_norm == b_norm or a_norm in b_norm or b_norm in a_norm
+
+
+def _is_ambiguous_title(title: str) -> bool:
+    """True for a "title" too weak to mean anything -- a single character,
+    or a bare number left over after year/token stripping (e.g. a filename
+    that was only a technical release tag)."""
+    stripped = title.strip()
+    return len(stripped) < 2 or stripped.isdigit()
+
+
+# Generic placeholder filenames that carry no title evidence of their own
+# -- common when a rip is properly named at the folder level ("Alien
+# (1979)/movie.mkv") but left generic at the file level. Treated as if the
+# filename had no title at all, so folder evidence isn't spuriously
+# flagged as "conflicting" with a word that was never really a title.
+_GENERIC_FILENAME_TITLES = frozenset({"movie", "movies", "video", "film", "untitled", "download"})
+
+
+def _has_real_title(cleaned: _CleanedRelease) -> bool:
+    return bool(cleaned.title) and cleaned.title.strip().lower() not in _GENERIC_FILENAME_TITLES
+
+
+def _parse_movie(input_data: IdentificationInput) -> IdentificationCandidate:
+    """Conservative movie title/year parsing.
+
+    Evidence preference order: filename title+year, parent directory
+    title+year, filename title without year, parent directory title
+    without year (this milestone's documented default order). Confidence
+    reflects the strength of what was actually parsed -- never HIGH merely
+    because the file lives in a movie category/layout. See "Confidence
+    rubric" below.
+
+    Confidence rubric:
+    - HIGH: a title and year were both parsed, with no conflict between
+      filename and parent-directory evidence.
+    - MEDIUM: a title was parsed but no year was found anywhere.
+    - LOW: filename and parent-directory evidence conflict (different
+      years, or clearly different titles), or the parsed title is too
+      weak to be meaningful (e.g. a bare number).
+    - UNKNOWN: no usable title could be parsed from either the filename or
+      the parent directory.
+    """
+    filename_clean = _clean_release_text(_strip_extension(input_data.filename))
+    # Only movie_folder/movie_collection_folder layouts have a per-movie
+    # parent directory; movie_flat's parent_directory is the category root
+    # itself (e.g. "/Volumes/movies"), which is never title evidence.
+    if input_data.layout in ("movie_folder", "movie_collection_folder"):
+        folder_clean = _clean_release_text(Path(input_data.parent_directory).name)
+    else:
+        folder_clean = _CleanedRelease(
+            title="", year=None, year_match=None, edition=None, part_number=None, removed_tokens=()
+        )
+
+    filename_has_title = _has_real_title(filename_clean)
+    folder_has_title = _has_real_title(folder_clean)
+
+    title_source: str | None
+    year_source: str | None
+    if filename_has_title and filename_clean.year is not None:
+        primary, title_source, year_source = filename_clean, "filename", "filename"
+    elif folder_has_title and folder_clean.year is not None:
+        primary, title_source, year_source = folder_clean, "parent_directory", "parent_directory"
+    elif filename_has_title:
+        primary, title_source, year_source = filename_clean, "filename", None
+    elif folder_has_title:
+        primary, title_source, year_source = folder_clean, "parent_directory", None
+    else:
+        primary, title_source, year_source = filename_clean, None, None
+
+    years_conflict = (
+        filename_clean.year is not None
+        and folder_clean.year is not None
+        and filename_clean.year != folder_clean.year
+    )
+    titles_conflict = (
+        filename_has_title and folder_has_title and not _titles_similar(filename_clean.title, folder_clean.title)
+    )
+    conflicting = years_conflict or titles_conflict
+
+    title = primary.title if title_source is not None else None
+    year = primary.year if year_source is not None else None
+    edition = filename_clean.edition or folder_clean.edition
+    part_number = filename_clean.part_number or folder_clean.part_number
+
+    if title is None:
+        confidence = Confidence.UNKNOWN
+    elif conflicting or _is_ambiguous_title(title):
+        confidence = Confidence.LOW
+    elif year is not None:
+        confidence = Confidence.HIGH
+    else:
+        confidence = Confidence.MEDIUM
+
+    removed_tokens = sorted(set(filename_clean.removed_tokens) | set(folder_clean.removed_tokens))
+    evidence: dict[str, object] = {
+        "title_source": title_source,
+        "year_source": year_source,
+        "filename_title": filename_clean.title or None,
+        "filename_year": filename_clean.year,
+        "folder_title": folder_clean.title or None,
+        "folder_year": folder_clean.year,
+        "removed_tokens": removed_tokens,
+    }
+    if year_source is not None and primary.year_match is not None:
+        evidence["year_match"] = primary.year_match
+    if conflicting:
+        evidence["conflict"] = "title_or_year_mismatch_between_filename_and_folder"
+
+    return IdentificationCandidate(
+        media_file_id=input_data.media_file_id,
+        candidate_type=CandidateType.MOVIE,
+        confidence=confidence,
+        parser_version=PARSER_VERSION,
+        evidence=evidence,
+        parsed_title=title,
+        parsed_year=year,
+        edition=edition,
+        part_number=part_number,
+    )
