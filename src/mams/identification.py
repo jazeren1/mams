@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from . import inventory
+
 # Bumped whenever parsing logic changes meaningfully. Every `mams identify
 # evaluate` run re-parses every ACTIVE file unconditionally (see
 # identification_service.py), so a version bump takes effect on the very
@@ -364,12 +366,16 @@ def _parse_movie(input_data: IdentificationInput) -> IdentificationCandidate:
     part_number = filename_clean.part_number or folder_clean.part_number
 
     if title is None:
+        candidate_type = CandidateType.UNKNOWN
         confidence = Confidence.UNKNOWN
     elif conflicting or _is_ambiguous_title(title):
+        candidate_type = CandidateType.MOVIE
         confidence = Confidence.LOW
     elif year is not None:
+        candidate_type = CandidateType.MOVIE
         confidence = Confidence.HIGH
     else:
+        candidate_type = CandidateType.MOVIE
         confidence = Confidence.MEDIUM
 
     removed_tokens = sorted(set(filename_clean.removed_tokens) | set(folder_clean.removed_tokens))
@@ -389,7 +395,7 @@ def _parse_movie(input_data: IdentificationInput) -> IdentificationCandidate:
 
     return IdentificationCandidate(
         media_file_id=input_data.media_file_id,
-        candidate_type=CandidateType.MOVIE,
+        candidate_type=candidate_type,
         confidence=confidence,
         parser_version=PARSER_VERSION,
         evidence=evidence,
@@ -622,3 +628,54 @@ def _parse_television(input_data: IdentificationInput) -> IdentificationCandidat
         episode_title=episode_title,
         special_type="season_zero" if is_special else None,
     )
+
+
+# --- classification: which parser to run ---------------------------------------
+
+_MOVIE_LAYOUTS = frozenset({"movie_flat", "movie_folder", "movie_collection_folder"})
+_TV_LAYOUTS = frozenset({"tv_series_folder", "tv_season_folder"})
+
+
+def _parse_unclassified(input_data: IdentificationInput) -> IdentificationCandidate:
+    """Neither category nor layout indicates movie or TV. Falls back to
+    whichever parser's own pattern evidence actually fires in the
+    filename -- a clear S01E02 pattern or an explicit year is real
+    evidence of type independent of where the file lives.
+
+    The movie fallback deliberately requires a parsed year, not just a
+    parsed title: with no directory placement to lean on, a bare word
+    (e.g. "readme") would otherwise "parse" as a MEDIUM-confidence movie
+    title, which is exactly the kind of directory-independent guess this
+    milestone's brief warns against. A year is a much stronger, more
+    specific signal that this file is actually a movie.
+    """
+    television_candidate = _parse_television(input_data)
+    if television_candidate.candidate_type != CandidateType.UNKNOWN:
+        return television_candidate
+    movie_candidate = _parse_movie(input_data)
+    if movie_candidate.parsed_year is not None:
+        return movie_candidate
+    return television_candidate
+
+
+def evaluate_file(input_data: IdentificationInput) -> IdentificationCandidate:
+    """Parse one file's local identification candidate.
+
+    Category and layout decide *which* parser runs -- legitimate evidence
+    of content class, since a file's location in a movie- or TV-style
+    directory is a real (if weak) signal. They are never used to inflate
+    *confidence*: each parser derives its own confidence purely from the
+    strength of what it actually parsed (see each parser's confidence
+    rubric), so a file sitting in a movie/TV directory with an
+    unparseable name still comes back LOW/UNKNOWN, never HIGH.
+
+    Always returns exactly one candidate, never raises for a file this
+    milestone can't confidently classify -- worst case is a MOVIE/EPISODE
+    candidate at confidence UNKNOWN/LOW, or a genuinely UNKNOWN candidate
+    type when even category/layout give no signal.
+    """
+    if input_data.category in inventory.MOVIE_CATEGORIES or input_data.layout in _MOVIE_LAYOUTS:
+        return _parse_movie(input_data)
+    if input_data.category in inventory.TV_CATEGORIES or input_data.layout in _TV_LAYOUTS:
+        return _parse_television(input_data)
+    return _parse_unclassified(input_data)

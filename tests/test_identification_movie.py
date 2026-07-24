@@ -179,12 +179,14 @@ def test_bare_year_with_no_title_yields_unknown() -> None:
     # The whole filename is consumed as the year; nothing is left as a title.
     candidate = ident._parse_movie(_input(filename="1979.mkv", parent_directory="/Volumes/movies"))
     assert candidate.parsed_title is None
+    assert candidate.candidate_type == CandidateType.UNKNOWN
     assert candidate.confidence == Confidence.UNKNOWN
 
 
 def test_only_technical_tokens_yields_unknown() -> None:
     candidate = ident._parse_movie(_input(filename="1080p.mkv", parent_directory="/Volumes/movies"))
     assert candidate.parsed_title is None
+    assert candidate.candidate_type == CandidateType.UNKNOWN
     assert candidate.confidence == Confidence.UNKNOWN
 
 
