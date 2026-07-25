@@ -100,10 +100,14 @@ def _normalize_title(title: str) -> str:
     return text
 
 
-def _title_similarity(a: str | None, b: str | None) -> float:
+def title_similarity(a: str | None, b: str | None) -> float:
     """1.0 for an exact normalized match, 0.0 if either title is missing,
     otherwise `difflib.SequenceMatcher`'s ratio on normalized text --
-    deterministic and dependency-free."""
+    deterministic and dependency-free. Exposed publicly (not just used
+    internally by `score_movie_match`/`score_episode_match`) so
+    `resolution_service.py` can rank competing TMDb series search results
+    by series-title similarity before choosing which ones to look up a
+    specific episode from."""
     if not a or not b:
         return 0.0
     norm_a, norm_b = _normalize_title(a), _normalize_title(b)
@@ -177,8 +181,8 @@ def score_movie_match(
     components: dict[str, float] = {}
 
     title_score = max(
-        _title_similarity(candidate.parsed_title, result.title),
-        _title_similarity(candidate.parsed_title, result.original_title),
+        title_similarity(candidate.parsed_title, result.title),
+        title_similarity(candidate.parsed_title, result.original_title),
     )
     components["title_score"] = title_score
     reasons.append(_title_reason("title", title_score))
@@ -224,7 +228,7 @@ def score_episode_match(
     components: dict[str, float] = {}
     weighted_components: list[tuple[float, float]] = []
 
-    series_title_score = _title_similarity(candidate.parsed_series_title, series_title)
+    series_title_score = title_similarity(candidate.parsed_series_title, series_title)
     components["title_score"] = series_title_score
     reasons.append(_title_reason("series title", series_title_score))
     weighted_components.append((series_title_score, EPISODE_SERIES_TITLE_WEIGHT))
@@ -254,7 +258,7 @@ def score_episode_match(
         reasons.append("local episode number unknown")
 
     if candidate.episode_title and result.episode_title:
-        episode_title_score = _title_similarity(candidate.episode_title, result.episode_title)
+        episode_title_score = title_similarity(candidate.episode_title, result.episode_title)
         components["episode_title_score"] = episode_title_score
         reasons.append(
             "episode title corroborates" if episode_title_score >= 0.8 else "episode title does not corroborate"

@@ -193,11 +193,17 @@ def test_get_tv_series_normalizes_detail() -> None:
 
 def test_get_tv_episode_normalizes_detail() -> None:
     session = FakeSession(
-        [FakeResponse(200, {"season_number": 1, "episode_number": 1, "name": "Pilot", "air_date": "2008-01-20", "runtime": 58})]
+        [
+            FakeResponse(
+                200,
+                {"id": 62085, "season_number": 1, "episode_number": 1, "name": "Pilot", "air_date": "2008-01-20", "runtime": 58},
+            )
+        ]
     )
     client, _ = _client(session)
     result = client.get_tv_episode(1396, 1, 1)
     assert result is not None
+    assert result.provider_id == 62085
     assert result.series_provider_id == 1396
     assert result.season_number == 1
     assert result.episode_number == 1

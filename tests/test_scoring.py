@@ -71,6 +71,7 @@ def _episode_result(
     runtime_seconds: int | None = None,
 ) -> EpisodeResult:
     return EpisodeResult(
+        provider_id=62085,
         series_provider_id=1396,
         season_number=season,
         episode_number=episode,

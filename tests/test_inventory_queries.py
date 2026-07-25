@@ -98,6 +98,23 @@ def _seed_library(
     )
 
 
+# --- get_media_file ----------------------------------------------------------
+
+
+def test_get_media_file_returns_matching_row(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    _seed_library(connection, tmp_path, "movies", [_scanned_file(tmp_path, "M (2001).mkv", category="movies")])
+    media_file_id = repo.list_media_files(connection)[0].id
+
+    record = repo.get_media_file(connection, media_file_id)
+
+    assert record is not None
+    assert record.filename == "M (2001).mkv"
+
+
+def test_get_media_file_returns_none_for_unknown_id(connection: sqlite3.Connection) -> None:
+    assert repo.get_media_file(connection, 999999) is None
+
+
 # --- list_media_files -------------------------------------------------------
 
 

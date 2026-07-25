@@ -82,6 +82,7 @@ class SeriesResult:
 
 @dataclass(frozen=True)
 class EpisodeResult:
+    provider_id: int
     series_provider_id: int
     season_number: int
     episode_number: int
@@ -313,6 +314,7 @@ class TMDbClient:
     @staticmethod
     def _normalize_episode_detail(series_id: int, payload: dict[str, Any]) -> EpisodeResult:
         return EpisodeResult(
+            provider_id=int(payload["id"]),
             series_provider_id=series_id,
             season_number=int(payload["season_number"]),
             episode_number=int(payload["episode_number"]),

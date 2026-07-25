@@ -945,6 +945,15 @@ def list_media_files(
     return [_row_to_media_file_record(row) for row in rows]
 
 
+def get_media_file(connection: sqlite3.Connection, media_file_id: int) -> MediaFileRecord | None:
+    """Look up a single media_files row by id, or None if it doesn't
+    exist. Added for Milestone 7B external resolution/ingest planning,
+    which needs to load one specific file rather than a filtered list."""
+    sql = _MEDIA_FILE_BASE_SELECT + " WHERE media_files.id = ?"
+    row = connection.execute(sql, (media_file_id,)).fetchone()
+    return _row_to_media_file_record(row) if row is not None else None
+
+
 def search_media_files(
     connection: sqlite3.Connection,
     query: str,
