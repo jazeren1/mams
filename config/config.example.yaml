@@ -38,6 +38,14 @@ tmdb:
   token_env_var: "TMDB_API_TOKEN"
   cache_ttl_seconds: 604800
 
+ingest:
+  incoming_roots:
+    - "/Users/CHANGE_ME/Media Archive/Incoming"
+  movie_destination_category: movies
+  tv_destination_category: tv
+  kids_movie_destination_category: kids_movies
+  kids_tv_destination_category: kids_shows
+
 verification:
   checksum_algorithm: "sha256"
   require_playback_check: true

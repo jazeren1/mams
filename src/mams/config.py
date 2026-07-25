@@ -30,6 +30,33 @@ class AppConfig:
     @property
     def tmdb_cache_ttl_seconds(self) -> int:
         return int(self.raw.get("tmdb", {}).get("cache_ttl_seconds", 7 * 24 * 3600))
+    @property
+    def ingest_incoming_roots(self) -> list[str]:
+        return list(self.raw.get("ingest", {}).get("incoming_roots", []))
+    @property
+    def incoming_categories(self) -> dict[str, str]:
+        """Synthesizes a category name for each configured incoming root
+        so Incoming files flow through the same canonical inventory scan
+        as NAS categories (see docs/DATABASE.md, "Incoming as a
+        category") -- `"incoming"` for a single root, `"incoming_1"`,
+        `"incoming_2"`, ... for more than one."""
+        roots = self.ingest_incoming_roots
+        if not roots:
+            return {}
+        if len(roots) == 1:
+            return {"incoming": roots[0]}
+        return {f"incoming_{i}": root for i, root in enumerate(roots, start=1)}
+    @property
+    def ingest_destination_categories(self) -> dict[str, str]:
+        """Maps a logical destination kind (movie/tv/kids_movie/kids_tv)
+        to the `nas.categories` key whose root path it resolves to."""
+        ingest = self.raw.get("ingest", {})
+        return {
+            "movie": ingest.get("movie_destination_category", "movies"),
+            "tv": ingest.get("tv_destination_category", "tv"),
+            "kids_movie": ingest.get("kids_movie_destination_category", "kids_movies"),
+            "kids_tv": ingest.get("kids_tv_destination_category", "kids_shows"),
+        }
 
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)
