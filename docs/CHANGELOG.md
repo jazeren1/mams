@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.7.0
+
+Added Milestone 7C: live TMDb acceptance, an operator-controlled
+identification override workflow, and a read-only execution-readiness
+audit. No filesystem executor exists; this milestone still executes
+nothing.
+
+`mams resolve provider-status` diagnoses TMDb configuration/authentication
+with at most one minimal, cached request (`TMDbClient.verify_credentials`,
+`GET /authentication`) -- distinguishes not-configured, invalid token,
+rate limited, network failure, malformed response, and success, and never
+prints, logs, or returns the token itself. `mams resolve cache-stats`/
+`cache-clear --expired-only` give read-only visibility into
+`provider_cache` and let expired rows be deleted on demand; neither
+touches `external_identities`, resolution attempts/assignments, or ingest
+plans.
+
+`mams identify override MEDIA_FILE_ID --type MOVIE|EPISODE ...` records an
+explicit, database-only manual identification for a file in a new
+`identification_overrides` table, entirely separate from
+`identification_candidates` -- the parser's own evidence is never
+overwritten. Resolves the known Incoming limitation (a year-less movie
+directly under `Incoming` parses `UNKNOWN`, per `_parse_unclassified()`'s
+deliberately unweakened year requirement) with an explicit operator
+action rather than a parser relaxation. `mams identify show-effective`
+shows whichever candidate resolution will actually use -- the active
+override if one exists, else the parsed candidate, tagged `PARSED` or
+`MANUAL_OVERRIDE`; `mams identify clear-override` reverts to the parsed
+candidate. `mams resolve evaluate` now resolves against this effective
+candidate; `resolution_attempts` records which override (if any) was
+active at resolve time, so a later override change can be told apart from
+no change at all.
+
+`mams ingest audit PLAN_ID` is a new, purely read-only execution-readiness
+audit for an `APPROVED` dry-run plan -- 25 checks
+(`READY_FOR_EXECUTOR`/`STALE`/`BLOCKED`/`INCOMPLETE`) covering plan
+approval/supersession state, source existence/state/path/size/mtime
+against a plan-time snapshot, current-candidate and current-assignment
+drift (including an override added or cleared after the plan was
+approved), external identity existence, the verification snapshot,
+destination configuration/collision/competing-plan state, and the
+proposed action list's completeness, ordering, supported types, and
+`PROPOSED_NOT_EXECUTED` state. Every result carries
+`"execution_status": "NOT_EXECUTED"`. `ingest_plans` gained
+`source_size_bytes`/`source_mtime` snapshot columns (populated at
+generation time), folded into the existing content-comparison/
+supersede-on-regeneration logic so a source file that changes size or
+mtime after approval is caught by both the audit and a subsequent
+regeneration, with no new reconciliation logic required.
+
+Two new migrations: `0011_identification_overrides.sql`
+(`identification_overrides` plus `resolution_attempts.identification_override_id`)
+and `0012_ingest_plan_source_snapshot.sql`
+(`ingest_plans.source_size_bytes`/`source_mtime`).
+
+Live TMDb acceptance tests (`tests/test_live_tmdb.py`) exercise the real
+API against a small, representative set of movies/episodes when
+explicitly enabled (`pytest -m live`, plus a real `TMDB_API_TOKEN`) --
+excluded from the default suite regardless of whether a token happens to
+be set. A new safety test
+(`tests/test_safety_no_execution.py`) monkeypatches every
+filesystem-mutating primitive (`Path.mkdir/rename/replace`,
+`shutil.move/copy/copy2`, `os.rename/replace/remove/unlink`,
+`subprocess.run/Popen`) across the full scan-to-audit workflow and
+confirms none of them fire.
+
 ## 0.6.0
 
 Added Milestone 7B: external identity resolution against TMDb and

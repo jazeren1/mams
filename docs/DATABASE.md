@@ -716,6 +716,146 @@ Provider popularity is never a scoring input (see `scoring.py`); movie
 result ranking uses it only as a final, documented tie-break when two
 results have an equal `total_score`.
 
+## Milestone 7C: Live Provider Acceptance and Ingest Workflow Hardening
+
+Two migrations, `0011`-`0012`. Both remain entirely read-only against the
+NAS and Plex, same as every milestone through 7B — no rename, move, copy,
+delete, replace, or directory creation exists anywhere in this codebase.
+
+### `identification_overrides`
+
+An explicit, operator-controlled override of a file's *effective* local
+identification, kept entirely separate from `identification_candidates`
+so the parser's own evidence (`parsed_title`/`evidence_json`/etc.) is
+never overwritten or lost — the same reasoning that keeps
+`external_identities` separate from `identification_candidates` in
+Milestone 7B applies here between an override and a parsed candidate.
+
+```sql
+CREATE TABLE identification_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_file_id INTEGER NOT NULL REFERENCES media_files(id) ON DELETE CASCADE,
+    candidate_type TEXT NOT NULL CHECK (candidate_type IN ('MOVIE','EPISODE')),
+    title TEXT,
+    year INTEGER,
+    series_title TEXT,
+    season_number INTEGER,
+    episode_numbers_json TEXT,
+    episode_title TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    cleared_at TEXT
+);
+```
+
+**Identity/uniqueness.** At most one *active* (`cleared_at IS NULL`)
+override per `media_file_id`, enforced by a partial unique index — the
+same at-most-one-current-row pattern as `media_identity_assignments`'
+at-most-one-`ACTIVE`-row rule and `ingest_plans`' at-most-one-current-plan
+rule. `identification_repository.create_override()` clears any existing
+active override first (`clear_override()`, setting `cleared_at`) rather
+than overwriting it in place, so a file's override history stays fully
+auditable across changes of mind — the cleared row is retained, never
+deleted.
+
+**`ON DELETE CASCADE` on `media_file_id`.** Same reasoning as
+`identification_candidates` (not `scan_changes`/`findings`'s `ON DELETE
+SET NULL`): an override is the *current* operator interpretation of a
+file that still exists, not evidence that must outlive it. Nothing
+deletes `media_files` rows today.
+
+**Effective candidate.** Computed at read time, never materialized as its
+own row: `identification_repository.get_effective_candidate()` returns
+the active override if one exists, else the current parsed candidate,
+tagged `source: "MANUAL_OVERRIDE" | "PARSED"`. `mams resolve evaluate`
+resolves against this effective candidate; `mams identify show-effective`
+displays it. A manual override's `confidence` is fixed `HIGH` (a human
+explicitly asserted it) — this has no effect on scoring or the
+auto-resolve threshold decision, both of which key off `candidate_type`
+and the parsed title/year/series/season/episode fields, never
+`confidence` itself.
+
+This is the sanctioned fix for the known Incoming limitation documented
+in Milestone 7B: `_parse_unclassified()`'s movie fallback still requires
+a parsed year (unweakened, still tested), so `Alien.mkv` directly under
+`Incoming` still parses `UNKNOWN` — but an operator can now run `mams
+identify override MEDIA_FILE_ID --type MOVIE --title "Alien" --year
+1979` to make it resolvable, with the parser's own `UNKNOWN` interpretation
+preserved untouched and separately auditable.
+
+### `resolution_attempts.identification_override_id`
+
+One nullable column added to the existing `resolution_attempts` table
+(`ALTER TABLE`, `ON DELETE SET NULL` — same evidence-must-outlive-its-
+subject reasoning as its `identification_candidate_id`/`media_file_id`
+columns): records whichever override was active when this attempt ran,
+or `NULL` if the attempt resolved the plain parsed candidate. This is the
+one piece of information the readiness audit's
+`current_candidate_matches_plan` check needs that the existing schema
+couldn't already provide — without it, there is no way to distinguish "an
+override was added or cleared after this assignment was made" from "the
+candidate hasn't changed," since the underlying `identification_candidates`
+row's `id` is unaffected either way.
+
+### `ingest_plans.source_size_bytes` / `source_mtime`
+
+Two nullable columns added to `ingest_plans` (`ALTER TABLE`), populated
+by `ingest_service.generate_plan()` from the already-loaded
+`MediaFileRecord` at generation time. Included in
+`ingest_repository._PLAN_CONTENT_COLUMNS`, so they participate in the
+existing no-churn / approved-plan-supersede-on-change comparison
+(`reconcile_plan()`, Milestone 7B) exactly like every other content
+column — a source file that changes size or `mtime` between plan
+generations is treated as an ordinary content change, and an `APPROVED`
+plan whose source has since drifted goes `SUPERSEDED` on the next
+regeneration, with no new reconciliation logic required. `verify_media()`
+already snapshots `size_bytes` inside `verification_json`, but nothing
+previously captured a comparable `mtime` snapshot, and neither was
+compared against a *later* re-check — that comparison is exactly what the
+readiness audit's `source_size_matches_plan_snapshot`/
+`source_mtime_matches_plan_snapshot` checks do.
+
+### Execution-readiness audit (`readiness.py`, no new schema)
+
+`mams ingest audit PLAN_ID` is a pure, read-only function
+(`readiness.evaluate_readiness()`) over a `ReadinessInput` gathered by
+`ingest_service.audit_plan()` — no new table. Twenty-five checks derive
+an overall `readiness_status`
+(`READY_FOR_EXECUTOR`/`STALE`/`BLOCKED`/`INCOMPLETE`, precedence in that
+order) covering plan approval/supersession state; source
+existence/state/path/size/mtime against the plan-time snapshot; whether
+the current parsed candidate and active override still match what the
+plan/assignment were built from; whether the active assignment and its
+external identity still exist and are still current; the verification
+snapshot; destination configuration, collision, and competing-plan state;
+and the proposed action list's completeness, ordering, supported types,
+and `PROPOSED_NOT_EXECUTED` state. Every check always runs and is always
+reported, regardless of which one(s) determine the overall status,
+so an operator sees the full picture rather than the first failure.
+`ReadinessResult.to_dict()` always includes `"execution_status":
+"NOT_EXECUTED"` — this audit reports state; it never regenerates a plan,
+re-resolves an identity, or writes anything (`ingest_service.audit_plan`
+contains no `INSERT`/`UPDATE`/`DELETE`). This is the formal contract
+between Milestone 7C and Milestone 8: a future executor is expected to
+require `READY_FOR_EXECUTOR` before acting on a plan, but no executor
+exists yet.
+
+### TMDb provider diagnostics and cache inspection
+
+`TMDbClient.verify_credentials()` (`tmdb.py`) makes one minimal, cached
+request (`GET /authentication`) solely to validate the configured token,
+reusing every existing error path (`_get`'s 401/403/429/timeout/
+connection/malformed-response handling) rather than adding new ones.
+`mams resolve provider-status` surfaces the result — configured/
+authentication/cache/network state — and never prints, logs, or returns
+the token itself. `provider_cache_repository.get_cache_stats()`/
+`clear_expired_entries()` back `mams resolve cache-stats`/`cache-clear
+--expired-only`: pure `provider_cache` read/delete operations that touch
+no other table (nothing else has a foreign key to `provider_cache`), so
+neither can affect `external_identities`, resolution attempts/
+assignments, or ingest plans.
+
 ## Primary keys
 
 `INTEGER AUTOINCREMENT` surrogates on all seven inventory tables. This
@@ -783,6 +923,16 @@ identification milestone exists.
   owned child rows, recreated wholesale on every plan regeneration)
 - `provider_cache` has no foreign keys — a pure HTTP cache has no
   relationship to any other table.
+
+**Milestone 7C additions:**
+
+- `identification_overrides.media_file_id → media_files.id`
+  (`ON DELETE CASCADE` — same reasoning as `identification_candidates`: a
+  live operator interpretation of a still-existing file, not evidence
+  that must outlive it)
+- `resolution_attempts.identification_override_id → identification_overrides.id`
+  (`ON DELETE SET NULL` — evidence must outlive its subject, same
+  reasoning as `resolution_attempts.identification_candidate_id`)
 
 ## Required indexes
 
@@ -857,6 +1007,12 @@ CREATE INDEX idx_ingest_plans_destination_library ON ingest_plans(destination_li
 
 CREATE UNIQUE INDEX idx_ingest_plan_actions_plan_order ON ingest_plan_actions(ingest_plan_id, action_order);
 CREATE INDEX idx_ingest_plan_actions_plan_id ON ingest_plan_actions(ingest_plan_id);
+
+-- Milestone 7C (database/migrations/0011-0012).
+CREATE UNIQUE INDEX idx_identification_overrides_active_media_file
+    ON identification_overrides(media_file_id) WHERE cleared_at IS NULL;
+CREATE INDEX idx_identification_overrides_media_file_id ON identification_overrides(media_file_id);
+CREATE INDEX idx_resolution_attempts_override_id ON resolution_attempts(identification_override_id);
 ```
 
 ## Migration strategy
@@ -875,6 +1031,16 @@ Numbered, forward-only SQL files under `database/migrations/`:
   fully retry-safe with no narrow-window caveat.
 - `0005_identification_candidates.sql` — `identification_candidates` and
   its indexes. Also fully `IF NOT EXISTS`, retry-safe like `0004`.
+- `0006`-`0010` — Milestone 7B: `provider_cache`, `external_identities`,
+  `resolution_attempts`, `resolution_matches`, `media_identity_assignments`,
+  `ingest_plans`, `ingest_plan_actions`, and the
+  `resolution_matches.series_provider_id` correction. See "Milestone 7B"
+  above.
+- `0011_identification_overrides.sql` — Milestone 7C: `identification_overrides`
+  and its indexes, plus `ALTER TABLE resolution_attempts ADD COLUMN
+  identification_override_id` (same narrow-window caveat as `0003`, below).
+- `0012_ingest_plan_source_snapshot.sql` — Milestone 7C: `ALTER TABLE
+  ingest_plans ADD COLUMN source_size_bytes`/`source_mtime` (same caveat).
 
 `schema_version` tracks the highest applied migration number. A migration
 runner applies any file numbered above the current version, in order,

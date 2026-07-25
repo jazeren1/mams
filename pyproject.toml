@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mams"
-version = "0.6.0"
+version = "0.7.0"
 description = "Media Archive Management System"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0", "rich>=13.0", "requests>=2.31"]
