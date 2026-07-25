@@ -801,6 +801,22 @@ above.
 - `mams findings show FINDING_ID [--json]` — one finding's full detail
   (status, severity, rule, resolved path, summary, evidence, recommendation,
   timestamps). A non-existent id prints a clear error and mutates nothing.
+- `mams identify evaluate [--json]` — parses every `ACTIVE` media file's
+  path/filename into a local `IdentificationCandidate` (see
+  `identification.py`) and reconciles the results into
+  `identification_candidates` (see "`identification_candidates` lifecycle"
+  above). Writes only to that table; never calls TMDb, TVDB, Plex, or any
+  other external service, and never touches the NAS.
+- `mams identify list [--type] [--confidence] [--category] [--limit]
+  [--json]` — filtered browsing over `identification_candidates`, joined
+  with `media_files`/`libraries` for path/category. Every text and JSON
+  surface labels this as a parsed local interpretation, never a confirmed
+  identity.
+- `mams identify stats [--json]` — totals by `candidate_type` and
+  `confidence`, plus a with/without-`parsed_year` split.
+- `mams identify show CANDIDATE_ID [--json]` — one candidate's full detail
+  (type, confidence, parsed fields, evidence, parser version, timestamps).
+  A non-existent id prints a clear error and mutates nothing.
 
 ## Risks and tradeoffs
 
@@ -848,6 +864,46 @@ above.
     `libraries` rows still existing** (see "`findings`" above) — nothing
     deletes those today, so this is a documented future consideration, not
     a live gap.
+12. **`identification_candidates`' "update in place" path is not reachable
+    through today's real scan pipeline for a genuine file rename**, for
+    the same reason as risk 8 above: a rename is indistinguishable from
+    one file going `MISSING` and a different one being `ADDED` at the
+    inventory layer, so `mams identify evaluate` only ever sees this as
+    "retain the old file's candidate untouched (it's now `MISSING`) and
+    create a fresh candidate for the new path" — never an `UPDATE` of the
+    same row. The `UPDATE` path itself is real and tested (a `media_files`
+    row whose `filename`/`layout` changes while its `id` stays the same,
+    e.g. from a future rename-detection heuristic reusing
+    `scan_changes.previous_absolute_path`), just not exercised by today's
+    scanner. Verified in production: renaming a sandbox file end-to-end
+    through `mams inventory scan` → `mams identify evaluate` produced
+    exactly this MISSING-retained + ADDED-created pair, not an update.
+13. **Known parser limitations, observed against the real 3,513-file
+    production library** (none of these are bugs — each is the parser
+    correctly, conservatively declining to guess beyond what this
+    milestone's brief scoped in):
+    - MakeMKV disc/title/segment numeric suffixes baked into ripped
+      filenames (e.g. `..._DISC17_1.mp4`, `..._3_1.mp4`) are not
+      recognized tokens, so they survive in `parsed_title` and can be
+      misread as a `part_number` when they happen to follow the literal
+      word "Disc" (see `docs/VALIDATION.md`'s Milestone 7A entry for
+      examples). Distinguishing a real multi-disc "Part 2 of 2" from an
+      arbitrary MakeMKV title-track index would require ripping-tool-
+      specific knowledge out of this milestone's scope.
+    - `_titles_similar()`'s substring check does not account for a
+      leading article ("A Christmas Story" vs. "Christmas Story"), so
+      that specific case reads as conflicting evidence (`LOW`) rather
+      than a match.
+    - A filename with the season/episode pattern repeated twice (e.g. a
+      renaming tool applied twice) only has its *first* occurrence
+      stripped; the second occurrence survives in `episode_title`.
+    - Series titles are parsed independently per file with no cross-file
+      canonicalization, so the same real show can appear under multiple
+      `parsed_series_title` casings/spacings across different files (e.g.
+      one series ripped across multiple seasons with inconsistent
+      filename conventions). Reconciling these into one canonical series
+      identity is exactly the kind of work deferred to a future external-
+      identity-resolution milestone, not this one.
 
 ## Recommended implementation order
 

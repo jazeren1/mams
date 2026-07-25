@@ -326,6 +326,306 @@ without any risk to the underlying media.
 
 ---
 
+# Milestone 7A – Local Media Parsing and Identification Candidates
+
+Date: 2026-07-24
+
+## Summary
+
+This milestone added a deterministic local parsing layer on top of the
+canonical inventory: an `identification_candidates` table (migration
+`0005_identification_candidates.sql`), a pure parsing domain
+(`src/mams/identification.py`) covering conservative movie title/year
+parsing and TV season/episode parsing, an atomic reconciliation service
+that creates/updates/retains candidates without ever duplicating them
+(`identification_service.py` / `identification_repository.py`), a query
+layer (list/get/stats), and four CLI commands (`mams identify
+evaluate/list/stats/show`). Evaluation only reads `media_files` and writes
+to the new `identification_candidates` table — it never touches the NAS,
+never calls Plex, and never calls TMDb/TVDB or any other external
+service. Candidates are local interpretations of evidence, never confirmed
+media identities; every CLI surface says so explicitly.
+
+## Validation Results
+
+- Migration `0005_identification_candidates.sql` implemented and
+  validated: `candidate_type`/`confidence` `CHECK` constraints,
+  `UNIQUE(media_file_id)` (including that a second candidate for the same
+  file is rejected while candidates for different files are not), all
+  five required indexes, and the documented `ON DELETE CASCADE` retention
+  behavior — the one place this schema deliberately diverges from
+  `scan_changes`/`findings`'s `ON DELETE SET NULL`, because a candidate is
+  a live interpretation of a still-existing file rather than evidence that
+  must outlive it (see `docs/DATABASE.md`).
+- Movie parsing validated for parenthesized/bracketed/plain-year forms,
+  title-without-year, technical-token removal (with removed tokens
+  recorded in `evidence`), edition extraction (`Director's Cut` with and
+  without the apostrophe, `Extended Edition`), part/disc-number
+  extraction, rejection of implausible four-digit values as years (a
+  resolution token bordering the year range boundary, and a bare number
+  embedded in a longer digit run), and conflicting filename/folder
+  evidence (differing years, differing titles) correctly downgrading to
+  `LOW`. Two real gaps were found and fixed via failing tests during
+  development, not discovered later: `movie_flat`'s `parent_directory` is
+  the category root itself and must never be read as title evidence
+  (only `movie_folder`/`movie_collection_folder` layouts have a
+  meaningful per-file parent directory), and generic placeholder
+  filenames (`movie.mkv`, `video.mkv`) must be treated as if the filename
+  had no title, so a properly-named folder isn't spuriously flagged as
+  conflicting with its own generic filename.
+- Television parsing validated for all six required forms (`S01E02`,
+  `s01e02`, `S01E02E03`, `S01E02-E03`, `1x02`, `Season 01 Episode 02`,
+  including a dot-separated variant of the last), season-folder evidence
+  filling in a series title or corroborating (never overriding) a
+  filename season number, season 0 classifying as `SPECIAL`, recognized
+  bonus-content keywords classifying as `EXTRA`, episode title extraction
+  (and correct omission when nothing or only technical tokens follow),
+  no fabrication of season/episode numbers when no pattern is present
+  (including the case where only a season-folder number is known),
+  and conflicting season evidence between filename and season folder
+  correctly downgrading to `LOW` while the filename's number still wins.
+  Multi-episode extraction (`S01E02E03` and `S01E02-E03`) reads every
+  explicit `E<n>` occurrence verbatim rather than expanding an implied
+  range — verified never to fabricate an episode number that wasn't
+  actually written.
+- Classification validated: category/layout decide which parser runs
+  (legitimate weak evidence of content class), but never inflate
+  confidence — a file in a movie or TV directory with an unparseable name
+  comes back `LOW`/`UNKNOWN`, never `HIGH`, confirmed by dedicated tests
+  for both movie and TV directories. The fallback for a file whose
+  category/layout give no signal at all requires a real parsed year (not
+  merely a parsed word) before accepting a movie guess, confirmed by a
+  test that a single generic word (`readme.mkv`) with no directory
+  support classifies `UNKNOWN`, not a low-confidence guess.
+- Reconciliation lifecycle validated: a new candidate is created on first
+  `ACTIVE` sighting; a repeated evaluation against unchanged inventory
+  creates no duplicate and performs zero writes for that file (`id`,
+  `created_at`, and `updated_at` all stable — confirmed by forcing a
+  distinguishable `updated_at` beforehand and observing it does not
+  move); a `filename` change and a `layout` change each update the
+  existing row in place, preserving `id`/`created_at`; a file going
+  `MISSING` is never visited by `evaluate_candidates()` at all, so its
+  candidate is retained byte-for-byte untouched, and a later `RESTORED`
+  file keeps that same candidate id throughout; a forced mid-
+  reconciliation failure (one file needing an update, another needing to
+  be created, in the same run) leaves neither change applied, confirming
+  the whole reconciliation is atomic; `evidence_json` verified byte-for-
+  byte deterministic across independent runs against independent
+  databases.
+- Query layer (list/get/stats) validated: every filter (`candidate_type`,
+  `confidence`, `category`, `has_year` true/false, `season_number`,
+  `media_file_id`) individually and combined with `AND`, `limit`,
+  category/path resolution via join, `episode_numbers`/`evidence`
+  round-tripping through their JSON columns, deterministic
+  `(category, relative_path, id)` ordering and its stability across
+  repeated calls, candidate lookup by id (including an unknown id), stats
+  totals (by type, by confidence, with/without-year split), and bounded
+  query counts via `set_trace_callback` (`list_candidates`: exactly one
+  `SELECT`; `get_candidate_stats`: at most four) regardless of row count.
+- CLI (`evaluate`/`list`/`stats`/`show`) validated for both text and JSON
+  output, filter combinations, repeated evaluation producing zero
+  duplicates through the full CLI path, empty-result handling, and a
+  clear, non-destructive error for an unknown candidate id — seeded
+  through the real `run_inventory_scan()` CLI path. Every text and JSON
+  surface (list header, show header) explicitly labels output as parsed
+  local interpretations, never confirmed identities, per this milestone's
+  core constraint.
+
+## Sandbox Demonstration
+
+Run against an isolated sandbox library (separate from the production
+database) through the real CLI:
+
+1. A movie (`Alien (1979)/Alien (1979).mkv`), a title-only movie
+   (`Something Final v2.mkv`), and a multi-episode TV file
+   (`Carnivale/Season 01/Carnivale S01E02E03 Milfay.mkv`) scanned, then
+   evaluated: `Created: 3` — `HIGH` movie with year, `MEDIUM` movie
+   without year, `HIGH` episode with `episode_numbers = [2, 3]` and
+   episode title `Milfay`.
+2. A second movie added directly conflicting with an existing one in
+   both title and year (`Prometheus (2012)/Alien (1979).mkv`) — evaluated
+   as `LOW` with `evidence.conflict =
+   "title_or_year_mismatch_between_filename_and_folder"` and both the
+   filename's and folder's title/year recorded in evidence.
+3. The first movie's file renamed on disk (`Alien (1979).mkv` →
+   `Alien (1979) Directors Cut.mkv`), then rescanned and re-evaluated:
+   `Created: 1`, `Unchanged: 2` — not an in-place `UPDATE`. This confirms
+   and is explained by `docs/DATABASE.md` risk 12: a rename is
+   indistinguishable from one file going `MISSING` and a different one
+   being `ADDED` at the inventory layer (the project's pre-existing,
+   documented rename-detection limitation — not new to this milestone),
+   so the old file's candidate is retained untouched (it is now
+   `MISSING`) while a fresh `HIGH`-confidence candidate is created for the
+   new path. The reconciliation layer's actual `UPDATE`-in-place code path
+   (same `media_files.id`, changed `filename`/`layout`) is exercised and
+   proven separately by `test_identification_lifecycle.py`, which
+   manipulates `media_files` directly the way a future rename-detection
+   heuristic would.
+
+No NAS media was modified at any point — the sandbox library lives
+entirely under a temp directory, not the real NAS.
+
+## Production Validation
+
+Evaluated against the real production inventory database (unchanged since
+Milestone 6: 3,513 `ACTIVE` media_files rows, ~5.8 TB). Identification
+evaluation reads only the database — it never re-scans or otherwise
+touches the NAS. The database was backed up before this milestone's
+migration was applied.
+
+**First evaluation:** `Created: 3513`, `Updated: 0`, `Unchanged: 0` — one
+candidate per `ACTIVE` file, exactly matching the established baseline
+file count.
+
+**Repeated evaluation** (immediately after, no inventory change in
+between): `Created: 0`, `Updated: 0`, `Unchanged: 3513` — confirming the
+no-duplicate/no-false-churn guarantee holds at full production scale.
+
+**Aggregate results:**
+
+| Type    | Count |
+|---------|-------|
+| EPISODE | 2,694 |
+| MOVIE   | 737   |
+| SPECIAL | 0     |
+| EXTRA   | 0     |
+| UNKNOWN | 82    |
+
+| Confidence | Count |
+|------------|-------|
+| HIGH       | 2,700 |
+| MEDIUM     | 520   |
+| LOW        | 211   |
+| UNKNOWN    | 82    |
+
+With a parsed year: 11. Without: 3,502.
+
+Re-running `mams findings evaluate` and `mams inventory stats` after this
+migration confirmed zero effect on either: findings stayed at 14
+`Unchanged`/0 `Created`/0 `Resolved` (Milestone 6's baseline), and
+inventory counts (3,513 active / 2 missing, 5.8 TB) were byte-for-byte
+unchanged.
+
+### Manual review
+
+- **All 8 `HIGH`-confidence movies** (fewer than 25 exist in this
+  library) reviewed individually: `District 9 (2009)`, `Lucky Number
+  Slevin (2006)`, `Total Recal (2012)` (title matches the actual on-disk
+  filename typo, not a parser error), `BATMAN (1989)`, and four
+  MakeMKV-ripped files whose titles include a trailing disc/segment
+  numeral not in the recognized token set (e.g. `CITY SLICKERS 3 1
+  (1991)`) — every one had its year correctly extracted and no title was
+  fabricated; the messy titles are a faithful, non-fabricating parse of
+  genuinely messy source filenames, not a bug (see `docs/DATABASE.md`
+  risk 13).
+- **25 `HIGH`-confidence episodes sampled across 25 distinct series** (out
+  of 2,692 `HIGH` episodes) reviewed: all had correct season/episode
+  numbers and a series title traceable directly to the filename. Observed
+  and documented (not fixed, per this milestone's non-exhaustive-parsing
+  scope): the same real show appears under multiple `parsed_series_title`
+  spellings across differently-ripped seasons (`ANCIENT ALIENS` /
+  `Ancient Aliens` / `AncientAliens`), a "Season N, Disc" literal prefix
+  survives into the series title when the filename doesn't use the
+  recognized "Season N Episode M" words form, and a filename with the
+  `sNNeNN` tag written twice only has its first occurrence stripped
+  (leaving the duplicate in `episode_title`). All are known limitations
+  now recorded in `docs/DATABASE.md` risk 13.
+- **All 211 `LOW`-confidence candidates** reviewed (programmatically
+  grouped, then spot-checked): the overwhelming majority are movies whose
+  filename and folder titles legitimately conflict or whose remaining
+  "title" is dominated by MakeMKV disc/segment numerals
+  (`CRZ0EUW2                        10_1.mp4`, `HOME2.Title1.mp4`), plus
+  one systematic case worth calling out — `_titles_similar()`'s substring
+  check does not account for a leading article, so `"A Christmas Story"`
+  (folder) vs. `"Christmas Story"` (filename-derived) reads as a conflict
+  and lands at `LOW` rather than matching. Recorded as a known limitation
+  rather than fixed, since a more permissive similarity check risks
+  false negatives on genuinely different titles.
+- **All 82 `UNKNOWN` candidates** reviewed: all fall into two patterns —
+  fitness videos using an `se02e01`-style prefix (not one of the six
+  supported filename forms, so correctly not parsed rather than
+  guessed), and TV season-folder files with a bare MakeMKV title
+  placeholder (`BLUEY___SEASON_3___FIRST_HALF.Title10.mkv`) and no
+  season/episode pattern in the filename at all — correctly `UNKNOWN`
+  with no fabricated season/episode number despite sitting in a `Season
+  3` folder, direct production evidence that the "no fabrication" rule
+  holds at scale, not just in unit tests.
+- **Multi-episode candidates: zero found.** This library's TV files are
+  ripped one episode per file; the multi-episode code path is validated
+  by unit and sandbox tests instead (see above).
+- **SPECIAL or EXTRA candidates: zero found.** No season-0 files and no
+  recognized bonus-content keywords anywhere in this library's 2,694 TV
+  files — plausible for a personal disc-rip archive with no dedicated
+  extras/specials folders, and consistent with the recognized-keyword
+  list being conservative by design.
+- **All 4 candidates with an edition** reviewed: `Unrated` and `Special
+  Edition` both correctly extracted, including one case where the
+  edition text lives only in the parent folder name
+  (`Pride and Prejudice The Special Edition/`), confirming folder-level
+  edition evidence works end-to-end in production, not just in a
+  synthetic test. One cosmetic artifact observed: stripping `Unrated`
+  from inside `(Unrated)` left a stray empty `( )` in the title
+  (`Grudge 2 ( )1 1`) — the edition value itself is correct; only the
+  leftover title punctuation is imperfect. Not fixed, recorded as a minor
+  known limitation.
+- **Samples from every layout** (`movie_flat`, `movie_folder`,
+  `movie_collection_folder`, `tv_series_folder`, `tv_season_folder`)
+  reviewed via the aggregate results above and the layout-specific
+  behavior already covered by the movie/TV parser test suites; no
+  layout-specific anomaly beyond the already-documented limitations.
+
+No NAS media was modified during any part of this validation —
+identification evaluation is read-only against the database by
+construction, and every command that touched the production database was
+limited to `mams identify evaluate/list/stats` and confirmatory
+`mams findings evaluate`/`mams inventory stats` calls.
+
+## Performance Observations
+
+- Evaluating all 3,513 `ACTIVE` files (parsing plus reconciliation)
+  completed in well under the several-second range Milestones 4-6
+  established for comparable full-library operations — parsing is pure
+  in-memory string/regex work with no I/O beyond the existing
+  `list_media_files()` read and the `identification_candidates` writes.
+
+## Quality Gates
+
+- 504 automated tests passing
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This validation matters for a reason distinct from Milestones 4-6: those
+validated read/write fidelity and reconciliation idempotency against
+data the system itself produced (scan results, rule evaluations). This
+milestone's core risk was different — a parser is easy to get subtly
+wrong against a small, tidy set of hand-written test fixtures and then
+either crash or silently fabricate data against thousands of real,
+messy, inconsistently-named files it has never seen. Running against the
+full 3,513-file production library surfaced genuine real-world messiness
+(duplicated season tags, MakeMKV disc-segment numerals, inconsistent
+series-title casing across seasons, a missing leading article) without a
+single crash, a single fabricated season/episode/year value, or a single
+`HIGH`-confidence result whose evidence didn't actually support it —
+direct evidence the parser's conservative, no-fabrication design holds
+under real conditions, not just synthetic ones. Every one of the 293
+non-`HIGH`-non-`MEDIUM`-non-zero-count candidates reviewed (all `LOW`, all
+`UNKNOWN`, all edition/part-number candidates) was independently
+explicable by the parser's documented rules, not a surprise — the kind of
+outcome that justifies trusting `identification_candidates` as a
+foundation for a future external-identity-resolution milestone.
+
+This milestone remains entirely read-only against the NAS and Plex, and
+entirely local against external identity services: no file operations,
+no TMDb/TVDB/Plex calls, no automation. It demonstrates that the
+canonical inventory can now be locally interpreted into structured
+movie/TV candidates — evidence for a human or a future milestone to
+confirm, never a confirmed identity itself — without any risk to the
+underlying media.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.

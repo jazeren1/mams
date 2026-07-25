@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0
+
+Added a deterministic local parsing layer: `mams identify evaluate` parses
+every `ACTIVE` media file's path/filename/category/layout into a structured
+`IdentificationCandidate` (movie title+year, or TV series/season/episode)
+and persists it to a new `identification_candidates` table, reconciling in
+place (`UNIQUE(media_file_id)`) rather than accumulating history --
+candidates are local interpretations of evidence, not confirmed media
+identities. Movie parsing recognizes parenthesized/bracketed/plain-year
+forms, common technical release tokens, edition labels, and part/disc
+markers. TV parsing recognizes `S01E02`, `s01e02`, `S01E02E03`,
+`S01E02-E03`, `1x02`, and `Season 01 Episode 02`, with season-folder
+evidence filling in a series title or corroborating (never overriding) a
+filename season number, season 0 classified `SPECIAL`, and recognized
+bonus-content keywords classified `EXTRA`. Confidence is `HIGH` only when
+strong evidence was actually parsed (never merely from a movie/TV
+directory), `MEDIUM` when partial, `LOW` on conflicting filename/folder
+evidence or a too-weak title, `UNKNOWN` with no usable evidence at all.
+`mams identify list/stats/show` provide read-only browsing, filtering, and
+detail lookup; every surface labels results as parsed candidates, not
+confirmed identities.
+
+A file going `MISSING` is never re-evaluated -- its last candidate is
+retained untouched rather than removed, so a later `RESTORED` file keeps
+its interpretation throughout. This milestone never calls TMDb, TVDB,
+Plex, or any other external service, and remains entirely read-only
+against the NAS: no file operations, no external identity resolution.
+
 ## 0.4.0
 
 Added a read-only findings engine: `mams findings evaluate` runs nine
