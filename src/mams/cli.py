@@ -13,6 +13,10 @@ from . import findings_repository
 from . import findings_service
 from . import identification_repository
 from . import identification_service
+from . import ingest_repository
+from . import ingest_service
+from . import resolution_repository
+from . import resolution_service
 console = Console()
 
 DEFAULT_INVENTORY_REPORT = "reports/library.json"
@@ -157,6 +161,92 @@ def build_parser() -> argparse.ArgumentParser:
     show_identify_parser.add_argument("candidate_id", type=int)
     show_identify_parser.add_argument("--json", action="store_true")
 
+    resolve_parser = subs.add_parser("resolve")
+    resolve_subs = resolve_parser.add_subparsers(dest="resolve_command", required=True)
+
+    evaluate_resolve_parser = resolve_subs.add_parser(
+        "evaluate",
+        help="Resolve local identification candidates against TMDb and persist ranked matches. "
+        "Requires TMDB_API_TOKEN to be configured.",
+    )
+    evaluate_resolve_parser.add_argument("--media-file-id", type=int, default=None)
+    evaluate_resolve_parser.add_argument("--candidate-id", type=int, default=None)
+    evaluate_resolve_parser.add_argument("--category", default=None)
+    evaluate_resolve_parser.add_argument(
+        "--limit", type=int, default=10,
+        help="Maximum number of candidates to evaluate in one run (default: 10) -- unlike local "
+        "identification, each evaluation costs a real TMDb request, so there is no unlimited default.",
+    )
+    evaluate_resolve_parser.add_argument(
+        "--force", action="store_true", help="Re-evaluate candidates that already have a resolution attempt."
+    )
+    evaluate_resolve_parser.add_argument("--json", action="store_true")
+
+    list_resolve_parser = resolve_subs.add_parser("list", help="List resolution attempts. Read-only.")
+    list_resolve_parser.add_argument(
+        "--status", type=str.upper,
+        choices=["PENDING", "RESOLVED", "REVIEW_REQUIRED", "NO_MATCH", "FAILED", "SKIPPED"], default=None,
+    )
+    list_resolve_parser.add_argument("--media-file-id", type=int, default=None)
+    list_resolve_parser.add_argument("--category", default=None)
+    list_resolve_parser.add_argument("--limit", type=int, default=None)
+    list_resolve_parser.add_argument("--json", action="store_true")
+
+    show_resolve_parser = resolve_subs.add_parser("show", help="Show one resolution attempt with ranked alternatives. Read-only.")
+    show_resolve_parser.add_argument("attempt_id", type=int)
+    show_resolve_parser.add_argument("--json", action="store_true")
+
+    select_resolve_parser = resolve_subs.add_parser(
+        "select", help="Manually confirm one ranked match for a resolution attempt. Writes no media files."
+    )
+    select_resolve_parser.add_argument("attempt_id", type=int)
+    select_resolve_parser.add_argument("match_id", type=int)
+    select_resolve_parser.add_argument("--json", action="store_true")
+
+    reject_resolve_parser = resolve_subs.add_parser(
+        "reject", help="Manually reject every match for a resolution attempt. Creates no assignment."
+    )
+    reject_resolve_parser.add_argument("attempt_id", type=int)
+    reject_resolve_parser.add_argument("--json", action="store_true")
+
+    stats_resolve_parser = resolve_subs.add_parser("stats", help="Show resolution attempt statistics. Read-only.")
+    stats_resolve_parser.add_argument("--json", action="store_true")
+
+    ingest_parser = subs.add_parser("ingest")
+    ingest_subs = ingest_parser.add_subparsers(dest="ingest_command", required=True)
+
+    plan_ingest_parser = ingest_subs.add_parser(
+        "plan", help="Generate (or reconcile) a dry-run ingest plan for one media file. No filesystem changes."
+    )
+    plan_ingest_parser.add_argument("media_file_id", type=int)
+    plan_ingest_parser.add_argument(
+        "--destination-category", dest="destination_category", type=str.lower,
+        choices=sorted(ingest_service.DESTINATION_CATEGORY_HINTS), default=None,
+    )
+    plan_ingest_parser.add_argument("--json", action="store_true")
+
+    plans_ingest_parser = ingest_subs.add_parser("plans", help="List dry-run ingest plans. Read-only.")
+    plans_ingest_parser.add_argument(
+        "--status", type=str.upper,
+        choices=["DRAFT", "READY_FOR_REVIEW", "REVIEW_REQUIRED", "BLOCKED", "APPROVED", "SUPERSEDED"], default=None,
+    )
+    plans_ingest_parser.add_argument("--category", default=None)
+    plans_ingest_parser.add_argument("--limit", type=int, default=None)
+    plans_ingest_parser.add_argument("--json", action="store_true")
+
+    show_ingest_parser = ingest_subs.add_parser("show", help="Show one dry-run ingest plan with its proposed actions. Read-only.")
+    show_ingest_parser.add_argument("plan_id", type=int)
+    show_ingest_parser.add_argument("--json", action="store_true")
+
+    stats_ingest_parser = ingest_subs.add_parser("stats", help="Show dry-run ingest plan statistics. Read-only.")
+    stats_ingest_parser.add_argument("--json", action="store_true")
+
+    approve_ingest_parser = ingest_subs.add_parser(
+        "approve", help="Mark a READY_FOR_REVIEW plan APPROVED. Database state only -- no actions are executed."
+    )
+    approve_ingest_parser.add_argument("plan_id", type=int)
+    approve_ingest_parser.add_argument("--json", action="store_true")
+
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
     )
@@ -190,8 +280,14 @@ def run_inventory_scan(
     read). The function's return value is always this scan's in-memory
     result, regardless of which report was written to disk.
     """
+    # Incoming roots (Milestone 7B) are scanned as additional categories,
+    # merged in alongside the NAS categories -- see AppConfig.incoming_categories
+    # and docs/DATABASE.md ("Incoming as a category"). No change to
+    # inventory.py itself: it has always operated on a plain category-name
+    # -> root-path mapping.
+    categories = {**config.nas_categories, **config.incoming_categories}
     provider = mediainfo.MediaInfoProvider() if metadata else None
-    report = inventory.scan_categories(config.nas_categories, metadata_provider=provider)
+    report = inventory.scan_categories(categories, metadata_provider=provider)
     output_report = report
 
     if use_db:
@@ -202,12 +298,12 @@ def run_inventory_scan(
             scan_run_id = inventory_repository.persist_scan(
                 connection,
                 report,
-                config.nas_categories,
+                categories,
                 metadata_enabled=metadata,
                 mediainfo_version=mediainfo_version,
             )
             console.print(f"[dim]Database scan run:[/dim] {scan_run_id} (COMPLETE)")
-            output_report = inventory_repository.read_inventory_report(connection, config.nas_categories)
+            output_report = inventory_repository.read_inventory_report(connection, categories)
         except Exception as exc:  # noqa: BLE001 - reported, not fatal to report generation
             console.print(f"[yellow]Database persistence failed:[/yellow] {exc}")
         finally:
@@ -863,6 +959,399 @@ def run_identify_show(
     return record
 
 
+def run_resolve_evaluate(
+    config: AppConfig,
+    *,
+    media_file_id: int | None = None,
+    candidate_id: int | None = None,
+    category: str | None = None,
+    limit: int = 10,
+    force: bool = False,
+    json_output: bool = False,
+) -> list[resolution_repository.AttemptRecord]:
+    """Resolve local identification candidates against TMDb, search ->
+    score -> decide -> persist. Requires a configured TMDb token; prints
+    a clear error and performs no writes at all (not even a FAILED
+    attempt) if none is configured -- every other existing command is
+    completely unaffected. Unlike `identify evaluate` (free, local),
+    each candidate here costs a real TMDb request, so `--limit` defaults
+    to a small number rather than evaluating unboundedly.
+    """
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        try:
+            provider = resolution_service.build_provider(config, connection)
+        except resolution_service.TMDbNotConfiguredError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return []
+
+        if candidate_id is not None:
+            single = identification_repository.get_candidate(connection, candidate_id)
+            candidates = [single] if single is not None else []
+        else:
+            candidates = identification_repository.list_candidates(
+                connection, media_file_id=media_file_id, category=category
+            )
+
+        if not force:
+            candidates = [
+                c for c in candidates
+                if resolution_repository.get_latest_attempt_for_candidate(connection, c.id) is None
+            ]
+        candidates = candidates[:limit]
+
+        attempts: list[resolution_repository.AttemptRecord] = []
+        for candidate in candidates:
+            media_file = inventory_repository.get_media_file(connection, candidate.media_file_id)
+            local_runtime = media_file.duration_seconds if media_file is not None else None
+            attempts.append(
+                resolution_service.evaluate_candidate(
+                    connection, provider, candidate_record=candidate, local_runtime_seconds=local_runtime
+                )
+            )
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[attempt.to_dict() for attempt in attempts])
+    else:
+        console.print(_render_resolve_evaluate_text(attempts))
+    return attempts
+
+
+def _render_resolve_evaluate_text(attempts: list[resolution_repository.AttemptRecord]) -> str:
+    lines = ["MAMS Resolution Evaluation", "=" * 26, "", f"Evaluated: {len(attempts)}"]
+    if attempts:
+        lines.append("")
+        for attempt in attempts:
+            top = attempt.matches[0] if attempt.matches else None
+            top_label = f" -> {top.title or top.series_title}" if top is not None else ""
+            lines.append(f"#{attempt.id} [{attempt.status}] {attempt.query_text or '(no query)'}{top_label}")
+    return "\n".join(lines)
+
+
+def _render_resolve_list_text(attempts: list[resolution_repository.AttemptRecord]) -> str:
+    if not attempts:
+        return "No matching resolution attempts."
+    lines = [f"{len(attempts)} attempt(s)", "", f"{'STATUS':<16} {'CATEGORY':<10} {'QUERY':<30} PATH"]
+    for attempt in attempts:
+        query = (attempt.query_text or "")[:30]
+        lines.append(f"{attempt.status:<16} {(attempt.category or '?'):<10} {query:<30} {attempt.absolute_path or '?'}")
+    return "\n".join(lines)
+
+
+def run_resolve_list(
+    config: AppConfig,
+    *,
+    status: str | None = None,
+    media_file_id: int | None = None,
+    category: str | None = None,
+    limit: int | None = None,
+    json_output: bool = False,
+) -> list[resolution_repository.AttemptRecord]:
+    """List resolution attempts. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        attempts = resolution_repository.list_attempts(
+            connection, status=status, media_file_id=media_file_id, category=category, limit=limit
+        )
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[attempt.to_dict() for attempt in attempts])
+    else:
+        console.print(_render_resolve_list_text(attempts))
+    return attempts
+
+
+def _render_resolve_attempt_text(attempt: resolution_repository.AttemptRecord) -> str:
+    lines = [f"Resolution Attempt #{attempt.id}", "=" * len(f"Resolution Attempt #{attempt.id}")]
+    lines.append(f"Status:   {attempt.status}")
+    lines.append(f"Provider: {attempt.provider}")
+    query_year = f" ({attempt.query_year})" if attempt.query_year else ""
+    lines.append(f"Query:    {attempt.query_text or '(none)'}{query_year}")
+    if attempt.absolute_path:
+        category = f"[{attempt.category}] " if attempt.category else ""
+        lines.append(f"Path:     {category}{attempt.absolute_path}")
+    if attempt.error_message:
+        lines.append(f"Error:    {attempt.error_message}")
+    lines.append("")
+    lines.append("Ranked matches:")
+    if not attempt.matches:
+        lines.append("  (none)")
+    for match in attempt.matches:
+        marker = " [SELECTED]" if match.selected else ""
+        label = match.title or match.series_title or "(untitled)"
+        if match.season_number is not None and match.episode_number is not None:
+            label += f" S{match.season_number:02d}E{match.episode_number:02d}"
+        lines.append(f"  #{match.rank} match_id={match.id} score={match.score:.4f} {label}{marker}")
+        for reason in cast("list[str]", match.scoring.get("reasons", [])):
+            lines.append(f"      - {reason}")
+    lines.append("")
+    lines.append(f"Started:   {attempt.started_at}")
+    if attempt.completed_at:
+        lines.append(f"Completed: {attempt.completed_at}")
+    return "\n".join(lines)
+
+
+def run_resolve_show(
+    config: AppConfig, attempt_id: int, *, json_output: bool = False
+) -> resolution_repository.AttemptRecord | None:
+    """Show one resolution attempt with its ranked alternatives. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        attempt = resolution_repository.get_attempt(connection, attempt_id)
+    finally:
+        connection.close()
+
+    if attempt is None:
+        console.print(f"[red]Resolution attempt {attempt_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=attempt.to_dict())
+    else:
+        console.print(_render_resolve_attempt_text(attempt))
+    return attempt
+
+
+def run_resolve_select(
+    config: AppConfig, attempt_id: int, match_id: int, *, json_output: bool = False
+) -> resolution_repository.AttemptRecord | None:
+    """Manually confirm one ranked match as the file's identity. Marks
+    the attempt RESOLVED and creates/updates the ACTIVE
+    media_identity_assignment with assignment_method=MANUAL. Writes no
+    media files."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        attempt = resolution_repository.get_attempt(connection, attempt_id)
+        if attempt is None:
+            console.print(f"[red]Resolution attempt {attempt_id} not found.[/red]")
+            return None
+        if not any(match.id == match_id for match in attempt.matches):
+            console.print(f"[red]Match {match_id} does not belong to attempt {attempt_id}.[/red]")
+            return None
+        updated = resolution_service.select_match_manually(connection, attempt_id=attempt_id, match_id=match_id)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=updated.to_dict())
+    else:
+        console.print(f"[green]Attempt {attempt_id} resolved via manual selection of match {match_id}.[/green]")
+        console.print(_render_resolve_attempt_text(updated))
+    return updated
+
+
+def run_resolve_reject(
+    config: AppConfig, attempt_id: int, *, json_output: bool = False
+) -> resolution_repository.AttemptRecord | None:
+    """Manually reject every match for a resolution attempt. Marks the
+    attempt NO_MATCH, creates no assignment, and preserves the ranked
+    alternatives."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        attempt = resolution_repository.get_attempt(connection, attempt_id)
+        if attempt is None:
+            console.print(f"[red]Resolution attempt {attempt_id} not found.[/red]")
+            return None
+        updated = resolution_service.reject_match_manually(connection, attempt_id=attempt_id)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=updated.to_dict())
+    else:
+        console.print(f"[yellow]Attempt {attempt_id} marked NO_MATCH (manually rejected).[/yellow]")
+        console.print(_render_resolve_attempt_text(updated))
+    return updated
+
+
+def _render_resolve_stats_text(stats: resolution_repository.AttemptStats) -> str:
+    lines = ["MAMS Resolution Statistics", "=" * 26, "", f"Total: {stats.total_count}"]
+    lines.append("By status: " + (", ".join(f"{k}={v}" for k, v in sorted(stats.status_counts.items())) or "none"))
+    return "\n".join(lines)
+
+
+def run_resolve_stats(config: AppConfig, *, json_output: bool = False) -> resolution_repository.AttemptStats:
+    """Show resolution attempt statistics. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        stats = resolution_repository.get_attempt_stats(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=stats.to_dict())
+    else:
+        console.print(_render_resolve_stats_text(stats))
+    return stats
+
+
+def _render_ingest_plan_text(plan: ingest_repository.PlanRecord) -> str:
+    lines = ["MAMS Dry-Run Ingest Plan", "=" * 24, "", f"Plan #{plan.id}"]
+    lines.append(f"Status: {plan.status}")
+    lines.append("Execution: NOT PERFORMED")
+    lines.append("")
+    lines.append("Source:")
+    lines.append(f"  {plan.source_path}")
+    if plan.verification_status:
+        lines.append("")
+        lines.append(f"Verification: {plan.verification_status}")
+        if plan.verification:
+            for check in cast("list[dict[str, object]]", plan.verification.get("checks", [])):
+                lines.append(f"  {check['code']}: {check['status']}")
+    if plan.destination_directory and plan.destination_filename:
+        lines.append("")
+        lines.append("Proposed destination:")
+        lines.append(f"  {plan.destination_directory}/{plan.destination_filename}")
+    if plan.blocking_reasons:
+        lines.append("")
+        lines.append("Reasons:")
+        for reason in plan.blocking_reasons:
+            lines.append(f"  - {reason}")
+    if plan.actions:
+        lines.append("")
+        lines.append("Proposed actions:")
+        for action in plan.actions:
+            lines.append(f"  {action.action_order}. {action.action_type} (PROPOSED -- NOT EXECUTED)")
+    lines.append("")
+    lines.append("No actions were executed.")
+    return "\n".join(lines)
+
+
+def run_ingest_plan(
+    config: AppConfig, media_file_id: int, *, destination_category: str | None = None, json_output: bool = False
+) -> ingest_repository.PlanRecord | None:
+    """Generate (or reconcile) the current dry-run ingest plan for one
+    media file. No filesystem changes; no Plex call. Returns None (after
+    printing a clear error) for a usage-level rejection -- unknown id,
+    not under a configured incoming root, or an invalid destination
+    category."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        try:
+            plan = ingest_service.generate_plan(
+                connection, config, media_file_id=media_file_id, destination_category=destination_category
+            )
+        except ingest_service.IngestPlanError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=plan.to_dict())
+    else:
+        console.print(_render_ingest_plan_text(plan))
+    return plan
+
+
+def _render_ingest_plans_text(plans: list[ingest_repository.PlanRecord]) -> str:
+    if not plans:
+        return "No matching plans."
+    lines = [f"{len(plans)} plan(s)", "", f"{'STATUS':<18} {'CATEGORY':<10} {'DESTINATION':<40} SOURCE"]
+    for plan in plans:
+        destination = f"{plan.destination_directory}/{plan.destination_filename}" if plan.destination_filename else "(none)"
+        lines.append(f"{plan.status:<18} {(plan.category or '?'):<10} {destination[:40]:<40} {plan.source_path}")
+    return "\n".join(lines)
+
+
+def run_ingest_plans(
+    config: AppConfig,
+    *,
+    status: str | None = None,
+    category: str | None = None,
+    limit: int | None = None,
+    json_output: bool = False,
+) -> list[ingest_repository.PlanRecord]:
+    """List dry-run ingest plans. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        plans = ingest_repository.list_plans(connection, status=status, category=category, limit=limit)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[plan.to_dict() for plan in plans])
+    else:
+        console.print(_render_ingest_plans_text(plans))
+    return plans
+
+
+def run_ingest_show(config: AppConfig, plan_id: int, *, json_output: bool = False) -> ingest_repository.PlanRecord | None:
+    """Show one dry-run ingest plan with its proposed actions. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        plan = ingest_repository.get_plan(connection, plan_id)
+    finally:
+        connection.close()
+
+    if plan is None:
+        console.print(f"[red]Ingest plan {plan_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=plan.to_dict())
+    else:
+        console.print(_render_ingest_plan_text(plan))
+    return plan
+
+
+def _render_ingest_stats_text(stats: ingest_repository.PlanStats) -> str:
+    lines = ["MAMS Ingest Plan Statistics", "=" * 27, "", f"Total: {stats.total_count}"]
+    lines.append("By status: " + (", ".join(f"{k}={v}" for k, v in sorted(stats.status_counts.items())) or "none"))
+    return "\n".join(lines)
+
+
+def run_ingest_stats(config: AppConfig, *, json_output: bool = False) -> ingest_repository.PlanStats:
+    """Show dry-run ingest plan statistics. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        stats = ingest_repository.get_plan_stats(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=stats.to_dict())
+    else:
+        console.print(_render_ingest_stats_text(stats))
+    return stats
+
+
+def run_ingest_approve(config: AppConfig, plan_id: int, *, json_output: bool = False) -> ingest_repository.PlanRecord | None:
+    """Mark a READY_FOR_REVIEW plan APPROVED. Database state only -- no
+    filesystem change, no Plex call. Returns None (after printing a clear
+    error) if the plan doesn't exist or isn't READY_FOR_REVIEW."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        try:
+            plan = ingest_service.approve(connection, plan_id)
+        except ingest_repository.PlanNotApprovableError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=plan.to_dict())
+    else:
+        console.print("Plan approved. No actions executed.")
+    return plan
+
+
 def run_mediainfo(path: str, *, json_output: bool) -> mediainfo.MediaInfoOutcome:
     """Diagnostic command: parse and display MediaInfo for a single file.
 
@@ -964,6 +1453,47 @@ def main() -> None:
             run_identify_stats(config, json_output=args.json)
         elif args.identify_command == "show":
             run_identify_show(config, args.candidate_id, json_output=args.json)
+    elif args.command == "resolve":
+        if args.resolve_command == "evaluate":
+            run_resolve_evaluate(
+                config,
+                media_file_id=args.media_file_id,
+                candidate_id=args.candidate_id,
+                category=args.category,
+                limit=args.limit,
+                force=args.force,
+                json_output=args.json,
+            )
+        elif args.resolve_command == "list":
+            run_resolve_list(
+                config,
+                status=args.status,
+                media_file_id=args.media_file_id,
+                category=args.category,
+                limit=args.limit,
+                json_output=args.json,
+            )
+        elif args.resolve_command == "show":
+            run_resolve_show(config, args.attempt_id, json_output=args.json)
+        elif args.resolve_command == "select":
+            run_resolve_select(config, args.attempt_id, args.match_id, json_output=args.json)
+        elif args.resolve_command == "reject":
+            run_resolve_reject(config, args.attempt_id, json_output=args.json)
+        elif args.resolve_command == "stats":
+            run_resolve_stats(config, json_output=args.json)
+    elif args.command == "ingest":
+        if args.ingest_command == "plan":
+            run_ingest_plan(
+                config, args.media_file_id, destination_category=args.destination_category, json_output=args.json
+            )
+        elif args.ingest_command == "plans":
+            run_ingest_plans(config, status=args.status, category=args.category, limit=args.limit, json_output=args.json)
+        elif args.ingest_command == "show":
+            run_ingest_show(config, args.plan_id, json_output=args.json)
+        elif args.ingest_command == "stats":
+            run_ingest_stats(config, json_output=args.json)
+        elif args.ingest_command == "approve":
+            run_ingest_approve(config, args.plan_id, json_output=args.json)
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 
