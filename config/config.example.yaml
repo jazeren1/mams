@@ -34,6 +34,10 @@ naming:
   episode_without_title: "{series} - S{season:02d}E{episode:02d}"
   season_folder: "Season {season:02d}"
 
+tmdb:
+  token_env_var: "TMDB_API_TOKEN"
+  cache_ttl_seconds: 604800
+
 verification:
   checksum_algorithm: "sha256"
   require_playback_check: true
