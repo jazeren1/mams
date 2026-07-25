@@ -1,0 +1,23 @@
+-- Source size/mtime snapshot on ingest_plans (Milestone 7C, Phase F):
+-- lets the execution-readiness audit detect "the source file changed
+-- since this plan was generated" (source_size_matches_plan_snapshot /
+-- source_mtime_matches_plan_snapshot). verify_media()'s evidence already
+-- records size_bytes inside verification_json, but nothing previously
+-- captured mtime, and there was no plan-time snapshot to compare a
+-- *later* re-check against for either field. See docs/DATABASE.md
+-- ("ingest_plans", Milestone 7C addendum).
+--
+-- These two columns are included in ingest_repository._PLAN_CONTENT_COLUMNS,
+-- so the existing no-churn / approved-plan-supersede-on-change machinery
+-- in reconcile_plan() picks them up for free: regenerating a plan after
+-- the source file's size or mtime changes now counts as a content change,
+-- which already means "mark an APPROVED plan SUPERSEDED, insert a fresh
+-- current plan" -- no new reconciliation logic, just two new snapshot
+-- values participating in the existing comparison.
+--
+-- SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS form, so these
+-- statements are not safely re-runnable if a crash lands between this
+-- script finishing and its schema_version row being recorded -- the same
+-- narrow, accepted caveat documented in 0003_scan_changes.sql.
+ALTER TABLE ingest_plans ADD COLUMN source_size_bytes INTEGER;
+ALTER TABLE ingest_plans ADD COLUMN source_mtime REAL;
