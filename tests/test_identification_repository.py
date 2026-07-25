@@ -404,3 +404,183 @@ def test_get_candidate_stats_uses_a_bounded_number_of_queries(connection: sqlite
 
     select_statements = [sql for sql in executed if sql.strip().upper().startswith("SELECT")]
     assert len(select_statements) <= 4, select_statements
+
+
+# --- identification_overrides: create / clear / replace ---------------------------
+
+
+def _seed_file_with_parsed_candidate(
+    connection: sqlite3.Connection, *, name: str = "Alien.mkv", candidate_type: str = "UNKNOWN",
+    parsed_title: str | None = None, parsed_year: int | None = None,
+) -> int:
+    library_id = _insert_library(connection)
+    scan_id = _insert_scan_run(connection)
+    media_file_id = _insert_media_file(connection, library_id=library_id, scan_id=scan_id, name=name)
+    _insert_candidate_row(
+        connection, media_file_id=media_file_id, candidate_type=candidate_type,
+        confidence="UNKNOWN" if candidate_type == "UNKNOWN" else "HIGH",
+        parsed_title=parsed_title, parsed_year=parsed_year,
+    )
+    return media_file_id
+
+
+def test_create_movie_override(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+
+    override = repo.create_override(
+        connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien", year=1979, reason="year-less filename"
+    )
+
+    assert override.candidate_type == "MOVIE"
+    assert override.title == "Alien"
+    assert override.year == 1979
+    assert override.cleared_at is None
+    assert override.reason == "year-less filename"
+
+
+def test_create_episode_override(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, name="Carnivale S01E02.mkv")
+
+    override = repo.create_override(
+        connection, media_file_id=media_file_id, candidate_type="EPISODE",
+        series_title="Carnivale", season_number=1, episode_numbers=(2,),
+    )
+
+    assert override.candidate_type == "EPISODE"
+    assert override.series_title == "Carnivale"
+    assert override.season_number == 1
+    assert override.episode_numbers == (2,)
+
+
+def test_movie_override_without_year_is_allowed(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    override = repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien")
+    assert override.year is None
+
+
+def test_movie_override_requires_title(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    with pytest.raises(repo.InvalidOverrideError):
+        repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE")
+
+
+def test_episode_override_requires_series_season_episode(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    with pytest.raises(repo.InvalidOverrideError):
+        repo.create_override(connection, media_file_id=media_file_id, candidate_type="EPISODE", series_title="Carnivale")
+    with pytest.raises(repo.InvalidOverrideError):
+        repo.create_override(
+            connection, media_file_id=media_file_id, candidate_type="EPISODE",
+            series_title="Carnivale", season_number=1,
+        )
+
+
+def test_replacing_active_override_clears_the_previous_one(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    first = repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien")
+
+    second = repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Aliens", year=1986)
+
+    assert second.id != first.id
+    cleared_first = repo.get_override(connection, first.id)
+    assert cleared_first is not None
+    assert cleared_first.cleared_at is not None
+    active = repo.get_active_override(connection, media_file_id)
+    assert active is not None
+    assert active.id == second.id
+
+
+def test_clear_override(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    created = repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien")
+
+    cleared = repo.clear_override(connection, media_file_id)
+
+    assert cleared is not None
+    assert cleared.id == created.id
+    assert cleared.cleared_at is not None
+    assert repo.get_active_override(connection, media_file_id) is None
+
+
+def test_clear_override_is_a_noop_when_nothing_active(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection)
+    assert repo.clear_override(connection, media_file_id) is None
+
+
+def test_original_parser_candidate_is_preserved_after_override(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, candidate_type="UNKNOWN")
+    parsed_before = repo.list_candidates(connection, media_file_id=media_file_id)[0]
+
+    repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+
+    parsed_after = repo.list_candidates(connection, media_file_id=media_file_id)[0]
+    assert parsed_after.id == parsed_before.id
+    assert parsed_after.candidate_type == "UNKNOWN"
+    assert parsed_after.parsed_title is None
+
+
+# --- effective candidate -----------------------------------------------------------
+
+
+def test_effective_candidate_is_parsed_when_no_override_exists(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, candidate_type="MOVIE", parsed_title="Alien", parsed_year=1979)
+
+    effective = repo.get_effective_candidate(connection, media_file_id)
+
+    assert effective is not None
+    assert effective.source == "PARSED"
+    assert effective.candidate_type == "MOVIE"
+    assert effective.parsed_title == "Alien"
+    assert effective.override_id is None
+
+
+def test_effective_candidate_is_override_when_active(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, candidate_type="UNKNOWN")
+    override = repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+
+    effective = repo.get_effective_candidate(connection, media_file_id)
+
+    assert effective is not None
+    assert effective.source == "MANUAL_OVERRIDE"
+    assert effective.candidate_type == "MOVIE"
+    assert effective.parsed_title == "Alien"
+    assert effective.parsed_year == 1979
+    assert effective.confidence == "HIGH"
+    assert effective.override_id == override.id
+    # the underlying parsed row's id is still carried for FK linkage
+    parsed = repo.list_candidates(connection, media_file_id=media_file_id)[0]
+    assert effective.identification_candidate_id == parsed.id
+
+
+def test_effective_candidate_reverts_to_parsed_after_clear(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, candidate_type="UNKNOWN")
+    repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien")
+    repo.clear_override(connection, media_file_id)
+
+    effective = repo.get_effective_candidate(connection, media_file_id)
+
+    assert effective is not None
+    assert effective.source == "PARSED"
+    assert effective.candidate_type == "UNKNOWN"
+
+
+def test_effective_candidate_none_when_neither_exists(connection: sqlite3.Connection) -> None:
+    library_id = _insert_library(connection)
+    scan_id = _insert_scan_run(connection)
+    media_file_id = _insert_media_file(connection, library_id=library_id, scan_id=scan_id, name="Untouched.mkv")
+    assert repo.get_effective_candidate(connection, media_file_id) is None
+
+
+def test_to_identification_candidate_round_trips_effective_fields(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_file_with_parsed_candidate(connection, candidate_type="UNKNOWN")
+    repo.create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+    effective = repo.get_effective_candidate(connection, media_file_id)
+    assert effective is not None
+
+    candidate = repo.to_identification_candidate(effective)
+
+    assert candidate.candidate_type.value == "MOVIE"
+    assert candidate.parsed_title == "Alien"
+    assert candidate.parsed_year == 1979
+    assert candidate.confidence.value == "HIGH"
+    assert candidate.evidence == {}

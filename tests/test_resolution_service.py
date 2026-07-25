@@ -4,6 +4,7 @@ orchestration, threshold/gap boundaries, and manual review."""
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -507,3 +508,96 @@ def test_build_provider_returns_a_client_when_token_configured(connection: sqlit
     config = AppConfig(raw={"tmdb": {"token_env_var": "TMDB_API_TOKEN"}})
     provider = build_provider(config, connection)
     assert isinstance(provider, TMDbClient)
+
+
+# --- effective candidate wiring (Milestone 7C, Phase D) ----------------------
+
+
+def test_evaluate_candidate_uses_effective_candidate_when_given(connection: sqlite3.Connection) -> None:
+    # The parsed candidate record is a MOVIE with no title/year at all
+    # (as if the file were UNKNOWN); the effective_candidate (standing in
+    # for an override) supplies "Alien"/1979, and resolution must use it.
+    media_file_id, candidate_id = _seed_movie(connection)
+    parsed = _movie_candidate_record(media_file_id, candidate_id=candidate_id, title="Alien", year=1979)
+    unparsed = replace(parsed, candidate_type="UNKNOWN", parsed_title=None, parsed_year=None)
+    effective = IdentificationCandidate(
+        media_file_id=media_file_id, candidate_type=CandidateType.MOVIE, confidence=Confidence.HIGH,
+        parser_version=1, evidence={}, parsed_title="Alien", parsed_year=1979,
+    )
+    provider = FakeProvider(movie_results=[_movie_result()])
+
+    attempt = evaluate_candidate(
+        connection, provider, candidate_record=unparsed, local_runtime_seconds=None, effective_candidate=effective,
+    )
+
+    assert attempt.status == "RESOLVED"
+    assert attempt.query_text == "Alien"
+    assert attempt.query_year == 1979
+
+
+def _seed_override(connection: sqlite3.Connection, *, media_file_id: int) -> int:
+    from mams.identification_repository import create_override
+
+    with connection:
+        override = create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+    return override.id
+
+
+def test_evaluate_candidate_records_override_id_on_attempt(connection: sqlite3.Connection) -> None:
+    media_file_id, candidate_id = _seed_movie(connection)
+    candidate = _movie_candidate_record(media_file_id, candidate_id=candidate_id)
+    override_id = _seed_override(connection, media_file_id=media_file_id)
+    provider = FakeProvider(movie_results=[_movie_result()])
+
+    attempt = evaluate_candidate(
+        connection, provider, candidate_record=candidate, local_runtime_seconds=None, override_id=override_id,
+    )
+
+    assert attempt.identification_override_id == override_id
+    stored = connection.execute(
+        "SELECT identification_override_id FROM resolution_attempts WHERE id = ?", (attempt.id,)
+    ).fetchone()
+    assert stored["identification_override_id"] == override_id
+
+
+def test_evaluate_candidate_override_id_defaults_to_none(connection: sqlite3.Connection) -> None:
+    media_file_id, candidate_id = _seed_movie(connection)
+    candidate = _movie_candidate_record(media_file_id, candidate_id=candidate_id)
+    provider = FakeProvider(movie_results=[_movie_result()])
+
+    attempt = evaluate_candidate(connection, provider, candidate_record=candidate, local_runtime_seconds=None)
+
+    assert attempt.identification_override_id is None
+
+
+def test_evaluate_candidate_override_id_recorded_on_skipped_attempt(connection: sqlite3.Connection) -> None:
+    media_file_id, candidate_id = _seed_movie(connection)
+    candidate = _movie_candidate_record(media_file_id, candidate_id=candidate_id)
+    override_id = _seed_override(connection, media_file_id=media_file_id)
+    effective = IdentificationCandidate(
+        media_file_id=media_file_id, candidate_type=CandidateType.UNKNOWN, confidence=Confidence.UNKNOWN,
+        parser_version=1, evidence={},
+    )
+    provider = FakeProvider()
+
+    attempt = evaluate_candidate(
+        connection, provider, candidate_record=candidate, local_runtime_seconds=None,
+        effective_candidate=effective, override_id=override_id,
+    )
+
+    assert attempt.status == "SKIPPED"
+    assert attempt.identification_override_id == override_id
+
+
+def test_evaluate_candidate_override_id_recorded_on_failed_attempt(connection: sqlite3.Connection) -> None:
+    media_file_id, candidate_id = _seed_movie(connection)
+    candidate = _movie_candidate_record(media_file_id, candidate_id=candidate_id)
+    override_id = _seed_override(connection, media_file_id=media_file_id)
+    provider = FakeProvider(error=TMDbTimeoutError("boom"))
+
+    attempt = evaluate_candidate(
+        connection, provider, candidate_record=candidate, local_runtime_seconds=None, override_id=override_id,
+    )
+
+    assert attempt.status == "FAILED"
+    assert attempt.identification_override_id == override_id

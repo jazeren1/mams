@@ -236,6 +236,7 @@ class AttemptRecord:
     selected_match_id: int | None
     algorithm_version: int
     created_at: str
+    identification_override_id: int | None
     matches: tuple[MatchRecord, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -272,6 +273,7 @@ def _row_to_attempt_record(row: sqlite3.Row, matches: tuple[MatchRecord, ...]) -
         selected_match_id=row["selected_match_id"],
         algorithm_version=row["algorithm_version"],
         created_at=row["created_at"],
+        identification_override_id=row["identification_override_id"],
         matches=matches,
     )
 
@@ -384,6 +386,7 @@ def record_attempt(
     error_message: str | None,
     matches: list[CandidateMatchInput],
     algorithm_version: int,
+    identification_override_id: int | None = None,
 ) -> AttemptRecord:
     """Insert one fully-formed resolution_attempts row plus its ranked
     resolution_matches, in a single call. Attempts are always recorded
@@ -391,15 +394,28 @@ def record_attempt(
     milestone): the entire search+score computation happens in
     `resolution_service.py` before anything is persisted, so `started_at`
     and `completed_at` both land in the same call. Not itself
-    transactional -- callers run this inside `with connection:`."""
+    transactional -- callers run this inside `with connection:`.
+    `identification_override_id` records whichever manual override (if
+    any) was active when this attempt ran -- `None` means the attempt
+    used the plain parsed candidate -- so a later readiness audit can tell
+    an override change apart from no change at all (Milestone 7C)."""
     cursor = connection.execute(
         """
         INSERT INTO resolution_attempts (
             identification_candidate_id, media_file_id, provider, status, query_text, query_year,
-            completed_at, error_message, algorithm_version
-        ) VALUES (?, ?, 'TMDB', ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            completed_at, error_message, algorithm_version, identification_override_id
+        ) VALUES (?, ?, 'TMDB', ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
         """,
-        (identification_candidate_id, media_file_id, status, query_text, query_year, error_message, algorithm_version),
+        (
+            identification_candidate_id,
+            media_file_id,
+            status,
+            query_text,
+            query_year,
+            error_message,
+            algorithm_version,
+            identification_override_id,
+        ),
     )
     attempt_id = cursor.lastrowid
     assert attempt_id is not None

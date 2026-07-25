@@ -283,6 +283,7 @@ def _record_terminal(
     query_year: int | None,
     error_message: str | None = None,
     matches: list[CandidateMatchInput] | None = None,
+    override_id: int | None = None,
 ) -> AttemptRecord:
     with connection:
         return record_attempt(
@@ -295,6 +296,7 @@ def _record_terminal(
             error_message=error_message,
             matches=matches or [],
             algorithm_version=ALGORITHM_VERSION,
+            identification_override_id=override_id,
         )
 
 
@@ -304,6 +306,8 @@ def evaluate_candidate(
     *,
     candidate_record: CandidateRecord,
     local_runtime_seconds: float | None,
+    effective_candidate: IdentificationCandidate | None = None,
+    override_id: int | None = None,
 ) -> AttemptRecord:
     """Resolve one identification_candidates row against TMDb: search,
     score, decide, and persist one resolution_attempts row (plus its
@@ -311,11 +315,24 @@ def evaluate_candidate(
     external_identities row and a media_identity_assignments row) -- all
     inside one transaction, so a failure partway through never leaves a
     partial write. Never raises for a provider failure (records status
-    FAILED instead); raises nothing else."""
-    candidate = _to_identification_candidate(candidate_record)
+    FAILED instead); raises nothing else.
+
+    `effective_candidate`/`override_id` (Milestone 7C, Phase D) let a
+    caller resolve against a manual override instead of the plain parsed
+    candidate: when `effective_candidate` is given, it is used in place of
+    `candidate_record`'s own parsed fields, and `override_id` is recorded
+    on the persisted attempt. Both default to `None`, reproducing this
+    function's original (pre-override) behavior exactly -- every existing
+    caller that omits them is unaffected. `candidate_record` is still
+    required in both cases: it supplies `id`/`media_file_id` for the
+    attempt's FK columns, which an override never replaces (overrides
+    don't get their own identification_candidates row)."""
+    candidate = effective_candidate if effective_candidate is not None else _to_identification_candidate(candidate_record)
 
     if candidate.candidate_type in (CandidateType.UNKNOWN, CandidateType.EXTRA):
-        return _record_terminal(connection, candidate_record, status="SKIPPED", query_text=None, query_year=None)
+        return _record_terminal(
+            connection, candidate_record, status="SKIPPED", query_text=None, query_year=None, override_id=override_id
+        )
 
     is_movie = candidate.candidate_type == CandidateType.MOVIE
     query_text = candidate.parsed_title if is_movie else candidate.parsed_series_title
@@ -331,7 +348,7 @@ def evaluate_candidate(
     except TMDbError as exc:
         return _record_terminal(
             connection, candidate_record, status="FAILED", query_text=query_text, query_year=query_year,
-            error_message=str(exc),
+            error_message=str(exc), override_id=override_id,
         )
 
     if is_movie:
@@ -378,6 +395,7 @@ def evaluate_candidate(
             error_message=None,
             matches=match_inputs,
             algorithm_version=ALGORITHM_VERSION,
+            identification_override_id=override_id,
         )
 
         if decision.status == "RESOLVED":

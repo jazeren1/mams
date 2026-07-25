@@ -35,7 +35,8 @@ import json
 import sqlite3
 from dataclasses import asdict, dataclass
 
-from .identification import IdentificationCandidate
+from . import identification
+from .identification import CandidateType, Confidence, IdentificationCandidate
 
 
 def _serialize_evidence(evidence: dict[str, object]) -> str | None:
@@ -382,4 +383,268 @@ def get_candidate_stats(connection: sqlite3.Connection) -> CandidateStats:
         confidence_counts=confidence_counts,
         with_year_count=year_row["with_year"] or 0,
         without_year_count=year_row["without_year"] or 0,
+    )
+
+
+# --- identification_overrides (Milestone 7C, Phase D) -----------------------
+#
+# An explicit, operator-controlled override of a file's effective local
+# identification, kept entirely separate from identification_candidates so
+# the parser's own evidence is never overwritten or lost (see
+# docs/DATABASE.md, "identification_overrides"). This module owns this SQL
+# too, mirroring its role for identification_candidates.
+
+
+class InvalidOverrideError(ValueError):
+    """Raised for an override request missing a field its candidate_type
+    requires -- MOVIE needs --title; EPISODE needs --series/--season/at
+    least one --episode. Raised before any write, so a rejected request
+    never touches the database."""
+
+
+@dataclass(frozen=True)
+class OverrideRecord:
+    """One identification_overrides row. `cleared_at` is `None` while the
+    override is active; a cleared override's row is retained (not
+    deleted), the same "supersede, don't erase" discipline as
+    media_identity_assignments."""
+
+    id: int
+    media_file_id: int
+    candidate_type: str
+    title: str | None
+    year: int | None
+    series_title: str | None
+    season_number: int | None
+    episode_numbers: tuple[int, ...]
+    episode_title: str | None
+    reason: str | None
+    created_at: str
+    updated_at: str
+    cleared_at: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["episode_numbers"] = list(self.episode_numbers)
+        return data
+
+
+def _row_to_override(row: sqlite3.Row) -> OverrideRecord:
+    episode_numbers = (
+        tuple(json.loads(row["episode_numbers_json"])) if row["episode_numbers_json"] is not None else ()
+    )
+    return OverrideRecord(
+        id=row["id"],
+        media_file_id=row["media_file_id"],
+        candidate_type=row["candidate_type"],
+        title=row["title"],
+        year=row["year"],
+        series_title=row["series_title"],
+        season_number=row["season_number"],
+        episode_numbers=episode_numbers,
+        episode_title=row["episode_title"],
+        reason=row["reason"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        cleared_at=row["cleared_at"],
+    )
+
+
+def get_active_override(connection: sqlite3.Connection, media_file_id: int) -> OverrideRecord | None:
+    """The currently active override for a file, or None if it has never
+    had one or its override was cleared. At most one row can ever match,
+    enforced by the partial unique index on (media_file_id) WHERE
+    cleared_at IS NULL."""
+    row = connection.execute(
+        "SELECT * FROM identification_overrides WHERE media_file_id = ? AND cleared_at IS NULL", (media_file_id,)
+    ).fetchone()
+    return _row_to_override(row) if row is not None else None
+
+
+def get_override(connection: sqlite3.Connection, override_id: int) -> OverrideRecord | None:
+    row = connection.execute("SELECT * FROM identification_overrides WHERE id = ?", (override_id,)).fetchone()
+    return _row_to_override(row) if row is not None else None
+
+
+def clear_override(connection: sqlite3.Connection, media_file_id: int) -> OverrideRecord | None:
+    """Clear the active override for a file, if any -- reverting the
+    effective candidate to the current parsed interpretation. A no-op
+    (returns `None`) if no override is currently active; the cleared row
+    is retained, never deleted. Not itself transactional -- callers run
+    this inside `with connection:`."""
+    existing = get_active_override(connection, media_file_id)
+    if existing is None:
+        return None
+    connection.execute(
+        "UPDATE identification_overrides SET cleared_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (existing.id,),
+    )
+    cleared = get_override(connection, existing.id)
+    assert cleared is not None
+    return cleared
+
+
+def create_override(
+    connection: sqlite3.Connection,
+    *,
+    media_file_id: int,
+    candidate_type: str,
+    title: str | None = None,
+    year: int | None = None,
+    series_title: str | None = None,
+    season_number: int | None = None,
+    episode_numbers: tuple[int, ...] | None = None,
+    episode_title: str | None = None,
+    reason: str | None = None,
+) -> OverrideRecord:
+    """Create a new active override for a file, clearing any existing
+    active override first -- the same "supersede, don't overwrite"
+    discipline as media_identity_assignments.assign_identity, so an
+    override's full history (what was overridden, when, why) stays
+    auditable across changes of mind rather than being overwritten in
+    place. Raises `InvalidOverrideError` (before any write) if a field
+    required by `candidate_type` is missing. Not itself transactional --
+    callers run this inside `with connection:`.
+    """
+    if candidate_type == "MOVIE":
+        if not title or not title.strip():
+            raise InvalidOverrideError("a MOVIE override requires a non-empty title")
+    elif candidate_type == "EPISODE":
+        if not series_title or not series_title.strip():
+            raise InvalidOverrideError("an EPISODE override requires a non-empty series title")
+        if season_number is None:
+            raise InvalidOverrideError("an EPISODE override requires a season number")
+        if not episode_numbers:
+            raise InvalidOverrideError("an EPISODE override requires at least one episode number")
+    else:
+        raise InvalidOverrideError(f"unsupported override candidate_type {candidate_type!r}; expected MOVIE or EPISODE")
+
+    clear_override(connection, media_file_id)
+
+    episode_numbers_json = (
+        json.dumps(list(episode_numbers), separators=(",", ":")) if episode_numbers else None
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO identification_overrides (
+            media_file_id, candidate_type, title, year, series_title, season_number,
+            episode_numbers_json, episode_title, reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (media_file_id, candidate_type, title, year, series_title, season_number, episode_numbers_json, episode_title, reason),
+    )
+    override_id = cursor.lastrowid
+    assert override_id is not None
+    override = get_override(connection, override_id)
+    assert override is not None
+    return override
+
+
+# --- effective candidate (Milestone 7C, Phase D) -----------------------------
+#
+# What resolution should actually use: an active manual override if one
+# exists, else the current parsed candidate. Computed at read time, never
+# materialized as its own table row -- there is exactly one place this can
+# drift from ("is there an active override right now"), and it is already
+# the single source of truth (identification_overrides).
+
+_EFFECTIVE_SOURCE_PARSED = "PARSED"
+_EFFECTIVE_SOURCE_OVERRIDE = "MANUAL_OVERRIDE"
+
+
+@dataclass(frozen=True)
+class EffectiveCandidate:
+    """The candidate identification resolution/planning should use for one
+    file right now, tagged with where it came from. `identification_candidate_id`
+    is always the underlying *parsed* row's id (for FK linkage -- overrides
+    never get their own identification_candidates row); `override_id` is
+    set only when `source` is MANUAL_OVERRIDE."""
+
+    media_file_id: int
+    source: str
+    candidate_type: str
+    confidence: str
+    parser_version: int
+    parsed_title: str | None
+    parsed_year: int | None
+    parsed_series_title: str | None
+    season_number: int | None
+    episode_number: int | None
+    episode_numbers: tuple[int, ...]
+    episode_title: str | None
+    identification_candidate_id: int | None
+    override_id: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["episode_numbers"] = list(self.episode_numbers)
+        return data
+
+
+def get_effective_candidate(connection: sqlite3.Connection, media_file_id: int) -> EffectiveCandidate | None:
+    """The effective candidate for a file: its active override if one
+    exists, else its current parsed candidate. Returns `None` only if
+    neither exists (the file has never been through `mams identify
+    evaluate`)."""
+    override = get_active_override(connection, media_file_id)
+    parsed_matches = list_candidates(connection, media_file_id=media_file_id)
+    parsed = parsed_matches[0] if parsed_matches else None
+
+    if override is not None:
+        return EffectiveCandidate(
+            media_file_id=media_file_id,
+            source=_EFFECTIVE_SOURCE_OVERRIDE,
+            candidate_type=override.candidate_type,
+            confidence=Confidence.HIGH.value,
+            parser_version=parsed.parser_version if parsed is not None else identification.PARSER_VERSION,
+            parsed_title=override.title,
+            parsed_year=override.year,
+            parsed_series_title=override.series_title,
+            season_number=override.season_number,
+            episode_number=override.episode_numbers[0] if override.episode_numbers else None,
+            episode_numbers=override.episode_numbers,
+            episode_title=override.episode_title,
+            identification_candidate_id=parsed.id if parsed is not None else None,
+            override_id=override.id,
+        )
+
+    if parsed is not None:
+        return EffectiveCandidate(
+            media_file_id=media_file_id,
+            source=_EFFECTIVE_SOURCE_PARSED,
+            candidate_type=parsed.candidate_type,
+            confidence=parsed.confidence,
+            parser_version=parsed.parser_version,
+            parsed_title=parsed.parsed_title,
+            parsed_year=parsed.parsed_year,
+            parsed_series_title=parsed.parsed_series_title,
+            season_number=parsed.season_number,
+            episode_number=parsed.episode_number,
+            episode_numbers=parsed.episode_numbers,
+            episode_title=parsed.episode_title,
+            identification_candidate_id=parsed.id,
+            override_id=None,
+        )
+
+    return None
+
+
+def to_identification_candidate(effective: EffectiveCandidate) -> IdentificationCandidate:
+    """Build the pure `identification.IdentificationCandidate` scoring/
+    resolution depend on from an `EffectiveCandidate`. `evidence` is
+    intentionally empty, mirroring `resolution_service._to_identification_candidate`
+    -- scoring never reads it."""
+    return IdentificationCandidate(
+        media_file_id=effective.media_file_id,
+        candidate_type=CandidateType(effective.candidate_type),
+        confidence=Confidence(effective.confidence),
+        parser_version=effective.parser_version,
+        evidence={},
+        parsed_title=effective.parsed_title,
+        parsed_year=effective.parsed_year,
+        parsed_series_title=effective.parsed_series_title,
+        season_number=effective.season_number,
+        episode_number=effective.episode_number,
+        episode_numbers=effective.episode_numbers,
+        episode_title=effective.episode_title,
     )
