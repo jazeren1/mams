@@ -25,8 +25,9 @@ from pathlib import Path, PurePosixPath
 from . import findings_repository, identification_repository, inventory_repository, resolution_repository
 from .config import AppConfig
 from .destination import DestinationError, DestinationPlan, episode_destination, movie_destination
-from .ingest_repository import PlanActionInput, PlanRecord, approve_plan, reconcile_plan
+from .ingest_repository import PlanActionInput, PlanRecord, approve_plan, get_plan, reconcile_plan
 from .inventory_repository import MediaFileRecord
+from .readiness import PlanActionSnapshot, ReadinessInput, ReadinessResult, evaluate_readiness
 from .resolution_repository import AssignmentRecord, ExternalIdentityRecord
 from .verification import VerificationInput, VerificationStatus, verify_media
 
@@ -267,6 +268,8 @@ def generate_plan(
             media_identity_assignment_id=assignment.id if assignment is not None else None,
             status=status,
             source_path=media_file.absolute_path,
+            source_size_bytes=media_file.size_bytes,
+            source_mtime=media_file.mtime,
             destination_library=destination_plan.library_root if destination_plan is not None else None,
             destination_directory=destination_plan.directory if destination_plan is not None else None,
             destination_filename=destination_plan.filename if destination_plan is not None else None,
@@ -284,3 +287,124 @@ def approve(connection: sqlite3.Connection, plan_id: int) -> PlanRecord:
     anything else."""
     with connection:
         return approve_plan(connection, plan_id)
+
+
+def _path_is_inside(path: str, root: str) -> bool:
+    normalized_root = root.rstrip("/")
+    return path == normalized_root or path.startswith(normalized_root + "/")
+
+
+def audit_plan(connection: sqlite3.Connection, config: AppConfig, *, plan_id: int) -> ReadinessResult:
+    """Read-only execution-readiness audit for one dry-run ingest plan
+    (Milestone 7C, Phase F) -- the formal contract a future Milestone 8
+    executor is expected to rely on. Gathers a fresh `readiness.ReadinessInput`
+    from the database/config and a read-only `Path.exists()` check (the
+    same kind `_check_collisions` above already performs), then hands it
+    to the pure `readiness.evaluate_readiness()`. Writes nothing: this
+    function contains no INSERT/UPDATE/DELETE anywhere. Raises
+    `IngestPlanError` for an unknown plan_id, the same usage-level
+    rejection `generate_plan` uses for an unknown media_file_id.
+    """
+    plan = get_plan(connection, plan_id)
+    if plan is None:
+        raise IngestPlanError(f"No ingest plan with id {plan_id}")
+
+    media_file = inventory_repository.get_media_file(connection, plan.media_file_id)
+
+    current_candidates = identification_repository.list_candidates(connection, media_file_id=plan.media_file_id)
+    current_candidate_id = current_candidates[0].id if current_candidates else None
+    current_override = identification_repository.get_active_override(connection, plan.media_file_id)
+
+    plan_assignment = (
+        resolution_repository.get_assignment(connection, plan.media_identity_assignment_id)
+        if plan.media_identity_assignment_id is not None
+        else None
+    )
+    plan_override_id: int | None = None
+    if plan_assignment is not None and plan_assignment.resolution_attempt_id is not None:
+        plan_attempt = resolution_repository.get_attempt(connection, plan_assignment.resolution_attempt_id)
+        if plan_attempt is not None:
+            plan_override_id = plan_attempt.identification_override_id
+
+    external_identity_exists = (
+        plan_assignment is not None
+        and resolution_repository.get_external_identity(connection, plan_assignment.external_identity_id) is not None
+    )
+
+    current_assignment = resolution_repository.get_active_assignment(connection, plan.media_file_id)
+
+    blocking_finding_count = len(
+        findings_repository.list_findings(connection, media_file_id=plan.media_file_id, status="ACTIVE", severity="ERROR")
+    ) + len(
+        findings_repository.list_findings(
+            connection, media_file_id=plan.media_file_id, status="ACTIVE", severity="CRITICAL"
+        )
+    )
+
+    destination_root_configured = (
+        plan.destination_library is not None and plan.destination_library in config.nas_categories.values()
+    )
+    destination_path_inside_root = (
+        plan.destination_library is not None
+        and plan.destination_directory is not None
+        and _path_is_inside(plan.destination_directory, plan.destination_library)
+    )
+
+    destination_still_unoccupied = True
+    competing_plan_id: int | None = None
+    if plan.destination_directory is not None and plan.destination_filename is not None:
+        full_path = str(PurePosixPath(plan.destination_directory) / plan.destination_filename)
+        if Path(full_path).exists():
+            destination_still_unoccupied = False
+        elif connection.execute("SELECT 1 FROM media_files WHERE absolute_path = ?", (full_path,)).fetchone():
+            destination_still_unoccupied = False
+        competing = connection.execute(
+            "SELECT id FROM ingest_plans WHERE destination_directory = ? AND destination_filename = ? "
+            "AND status != 'SUPERSEDED' AND media_file_id != ?",
+            (plan.destination_directory, plan.destination_filename, plan.media_file_id),
+        ).fetchone()
+        competing_plan_id = competing["id"] if competing is not None else None
+
+    def _execution_state(details: dict[str, object] | None) -> str | None:
+        value = (details or {}).get("execution_state")
+        return value if isinstance(value, str) else None
+
+    action_snapshots = tuple(
+        PlanActionSnapshot(
+            action_order=action.action_order,
+            action_type=action.action_type,
+            execution_state=_execution_state(action.details),
+            overwrite_requested=bool((action.details or {}).get("overwrite")),
+        )
+        for action in plan.actions
+    )
+
+    readiness_input = ReadinessInput(
+        plan_status=plan.status,
+        plan_source_path=plan.source_path,
+        plan_source_size_bytes=plan.source_size_bytes,
+        plan_source_mtime=plan.source_mtime,
+        plan_identification_candidate_id=plan.identification_candidate_id,
+        plan_identification_override_id=plan_override_id,
+        plan_media_identity_assignment_id=plan.media_identity_assignment_id,
+        plan_destination_library=plan.destination_library,
+        plan_destination_directory=plan.destination_directory,
+        plan_destination_filename=plan.destination_filename,
+        plan_verification_status=plan.verification_status,
+        plan_actions=action_snapshots,
+        source_media_file_exists=media_file is not None,
+        source_state=media_file.state if media_file is not None else None,
+        source_absolute_path=media_file.absolute_path if media_file is not None else None,
+        source_size_bytes=media_file.size_bytes if media_file is not None else None,
+        source_mtime=media_file.mtime if media_file is not None else None,
+        current_identification_candidate_id=current_candidate_id,
+        current_active_override_id=current_override.id if current_override is not None else None,
+        current_active_assignment_id=current_assignment.id if current_assignment is not None else None,
+        external_identity_exists=external_identity_exists,
+        current_blocking_finding_count=blocking_finding_count,
+        destination_root_configured=destination_root_configured,
+        destination_path_inside_root=destination_path_inside_root,
+        destination_still_unoccupied=destination_still_unoccupied,
+        competing_plan_id=competing_plan_id,
+    )
+    return evaluate_readiness(readiness_input)

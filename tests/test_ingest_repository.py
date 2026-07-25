@@ -66,6 +66,8 @@ def _plan_kwargs(media_file_id: int, **overrides: object) -> dict[str, object]:
         media_identity_assignment_id=None,
         status="DRAFT",
         source_path=f"/Incoming/file{media_file_id}.mkv",
+        source_size_bytes=1_000_000,
+        source_mtime=1700000000.0,
         destination_library=None,
         destination_directory=None,
         destination_filename=None,
@@ -141,6 +143,41 @@ def test_reconcile_plan_supersedes_approved_plan_on_change(connection: sqlite3.C
     current = get_current_plan_for_media_file(connection, media_file_id)
     assert current is not None
     assert current.id == second.id
+
+
+def test_source_snapshot_round_trips(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_media_file(connection)
+    plan = reconcile_plan(
+        connection,
+        **_plan_kwargs(media_file_id, status="READY_FOR_REVIEW", source_size_bytes=123456, source_mtime=1700000123.5),
+    )
+    assert plan.source_size_bytes == 123456
+    assert plan.source_mtime == 1700000123.5
+
+
+def test_source_size_change_supersedes_approved_plan(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_media_file(connection)
+    first = reconcile_plan(connection, **_plan_kwargs(media_file_id, status="READY_FOR_REVIEW", source_size_bytes=1000))
+    approve_plan(connection, first.id)
+
+    second = reconcile_plan(connection, **_plan_kwargs(media_file_id, status="READY_FOR_REVIEW", source_size_bytes=2000))
+
+    assert second.id != first.id
+    superseded = connection.execute("SELECT status FROM ingest_plans WHERE id = ?", (first.id,)).fetchone()
+    assert superseded["status"] == "SUPERSEDED"
+    assert second.source_size_bytes == 2000
+
+
+def test_source_mtime_change_supersedes_approved_plan(connection: sqlite3.Connection) -> None:
+    media_file_id = _seed_media_file(connection)
+    first = reconcile_plan(connection, **_plan_kwargs(media_file_id, status="READY_FOR_REVIEW", source_mtime=1000.0))
+    approve_plan(connection, first.id)
+
+    second = reconcile_plan(connection, **_plan_kwargs(media_file_id, status="READY_FOR_REVIEW", source_mtime=2000.0))
+
+    assert second.id != first.id
+    superseded = connection.execute("SELECT status FROM ingest_plans WHERE id = ?", (first.id,)).fetchone()
+    assert superseded["status"] == "SUPERSEDED"
 
 
 def test_reconcile_plan_leaves_approved_plan_untouched_when_unchanged(connection: sqlite3.Connection) -> None:

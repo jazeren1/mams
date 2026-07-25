@@ -11,7 +11,8 @@ import pytest
 from mams.config import AppConfig
 from mams.db import connect, migrate
 from mams.ingest_repository import PlanNotApprovableError, get_current_plan_for_media_file
-from mams.ingest_service import IngestPlanError, approve, generate_plan
+from mams.ingest_service import IngestPlanError, approve, audit_plan, generate_plan
+from mams.readiness import ReadinessStatus
 from mams.resolution_repository import assign_identity, upsert_external_identity
 
 REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "database" / "migrations"
@@ -362,6 +363,38 @@ def test_regeneration_after_identity_change_updates_plan(connection: sqlite3.Con
     assert count == 1
 
 
+def test_generate_plan_snapshots_source_size_and_mtime(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    connection.execute("UPDATE media_files SET mtime = ? WHERE id = ?", (1700000000.0, media_file_id))
+    config = _config(tmp_path)
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.source_size_bytes == 1_000_000
+    assert plan.source_mtime == 1700000000.0
+
+
+def test_regeneration_after_source_size_change_supersedes_approved_plan(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    first = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, first.id)
+
+    connection.execute("UPDATE media_files SET size_bytes = ? WHERE id = ?", (2_000_000, media_file_id))
+    second = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert second.id != first.id
+    assert second.source_size_bytes == 2_000_000
+    superseded = connection.execute("SELECT status FROM ingest_plans WHERE id = ?", (first.id,)).fetchone()
+    assert superseded["status"] == "SUPERSEDED"
+
+
 # --- approval ------------------------------------------------------------------
 
 
@@ -411,3 +444,238 @@ def test_current_plan_lookup_reflects_generated_plan(connection: sqlite3.Connect
     current = get_current_plan_for_media_file(connection, media_file_id)
     assert current is not None
     assert current.id == plan.id
+
+
+# --- execution-readiness audit (Milestone 7C, Phase F) --------------------------
+
+
+def test_audit_ready_approved_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    connection.execute("UPDATE media_files SET mtime = 1700000000.0 WHERE id = ?", (media_file_id,))
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.READY_FOR_EXECUTOR
+    assert all(c.passed for c in result.checks)
+    assert result.to_dict()["execution_status"] == "NOT_EXECUTED"
+
+
+def test_audit_unapproved_plan_is_blocked(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "READY_FOR_REVIEW"
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.BLOCKED
+
+
+def test_audit_superseded_plan_is_blocked(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    first = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, first.id)
+    connection.execute("UPDATE media_files SET size_bytes = 2000000 WHERE id = ?", (media_file_id,))
+    generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    result = audit_plan(connection, config, plan_id=first.id)
+
+    assert result.readiness_status == ReadinessStatus.BLOCKED
+    assert any(c.code == "plan_not_superseded" and not c.passed for c in result.checks)
+
+
+def test_audit_missing_source_is_stale(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+    connection.execute("UPDATE media_files SET state = 'MISSING' WHERE id = ?", (media_file_id,))
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.STALE
+    assert any(c.code == "source_state_active" and not c.passed for c in result.checks)
+
+
+def test_audit_changed_source_size_is_stale(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+    connection.execute("UPDATE media_files SET size_bytes = 2000000 WHERE id = ?", (media_file_id,))
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.STALE
+    assert any(c.code == "source_size_matches_plan_snapshot" and not c.passed for c in result.checks)
+
+
+def test_audit_changed_source_mtime_is_stale(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    connection.execute("UPDATE media_files SET mtime = 1700000000.0 WHERE id = ?", (media_file_id,))
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+    connection.execute("UPDATE media_files SET mtime = 1800000000.0 WHERE id = ?", (media_file_id,))
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.STALE
+    assert any(c.code == "source_mtime_matches_plan_snapshot" and not c.passed for c in result.checks)
+
+
+def test_audit_stale_candidate_after_override(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    from mams.identification_repository import create_override
+
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    with connection:
+        create_override(connection, media_file_id=media_file_id, candidate_type="MOVIE", title="Aliens", year=1986)
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.STALE
+    assert any(c.code == "current_candidate_matches_plan" and not c.passed for c in result.checks)
+
+
+def test_audit_stale_assignment_after_reassignment(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    other_identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=679, title="Aliens", release_year=1986)
+    assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=other_identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.STALE
+    assert any(c.code == "active_assignment_matches_plan" and not c.passed for c in result.checks)
+
+
+def test_audit_blocking_finding_makes_plan_blocked(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+    connection.execute(
+        "INSERT INTO findings (rule_code, severity, status, media_file_id, summary) "
+        "VALUES ('missing_file', 'ERROR', 'ACTIVE', ?, 'test finding')",
+        (media_file_id,),
+    )
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.BLOCKED
+    assert any(c.code == "no_current_blocking_findings" and not c.passed for c in result.checks)
+
+
+def test_audit_destination_collision_after_approval_blocks(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    destination = Path(plan.destination_directory) / plan.destination_filename
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(b"\0")
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.BLOCKED
+    assert any(c.code == "destination_still_unoccupied" and not c.passed for c in result.checks)
+
+
+def test_audit_competing_plan_blocks(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    other_media_file_id = _seed_media_file(connection, tmp_path, name="Other.mkv")
+    connection.execute(
+        """
+        INSERT INTO ingest_plans (media_file_id, status, source_path, destination_library, destination_directory, destination_filename)
+        VALUES (?, 'READY_FOR_REVIEW', ?, ?, ?, ?)
+        """,
+        (other_media_file_id, "/Incoming/Other.mkv", plan.destination_library, plan.destination_directory, plan.destination_filename),
+    )
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+
+    assert result.readiness_status == ReadinessStatus.BLOCKED
+    assert any(c.code == "no_competing_current_plan" and not c.passed for c in result.checks)
+
+
+def test_audit_unknown_plan_id_raises(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with pytest.raises(IngestPlanError):
+        audit_plan(connection, config, plan_id=999999)
+
+
+def test_audit_performs_no_mutations(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    executed: list[str] = []
+    connection.set_trace_callback(executed.append)
+    try:
+        audit_plan(connection, config, plan_id=plan.id)
+    finally:
+        connection.set_trace_callback(None)
+
+    mutating = [
+        sql for sql in executed
+        if sql.strip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    ]
+    assert mutating == []
+
+
+def test_audit_deterministic_across_repeated_calls(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    approve(connection, plan.id)
+
+    first = audit_plan(connection, config, plan_id=plan.id)
+    second = audit_plan(connection, config, plan_id=plan.id)
+
+    assert first.to_dict() == second.to_dict()

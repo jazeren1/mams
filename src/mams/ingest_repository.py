@@ -54,6 +54,8 @@ class PlanRecord:
     media_identity_assignment_id: int | None
     status: str
     source_path: str
+    source_size_bytes: int | None
+    source_mtime: float | None
     destination_library: str | None
     destination_directory: str | None
     destination_filename: str | None
@@ -130,6 +132,8 @@ def _row_to_plan(row: sqlite3.Row, actions: tuple[PlanActionRecord, ...]) -> Pla
         media_identity_assignment_id=row["media_identity_assignment_id"],
         status=row["status"],
         source_path=row["source_path"],
+        source_size_bytes=row["source_size_bytes"],
+        source_mtime=row["source_mtime"],
         destination_library=row["destination_library"],
         destination_directory=row["destination_directory"],
         destination_filename=row["destination_filename"],
@@ -227,6 +231,8 @@ _PLAN_CONTENT_COLUMNS = (
     "identification_candidate_id",
     "media_identity_assignment_id",
     "source_path",
+    "source_size_bytes",
+    "source_mtime",
     "destination_library",
     "destination_directory",
     "destination_filename",
@@ -258,6 +264,8 @@ def reconcile_plan(
     media_identity_assignment_id: int | None,
     status: str,
     source_path: str,
+    source_size_bytes: int | None,
+    source_mtime: float | None,
     destination_library: str | None,
     destination_directory: str | None,
     destination_filename: str | None,
@@ -290,6 +298,14 @@ def reconcile_plan(
       approval must never be silently mutated) and a new current plan is
       inserted with an incremented plan_version, carrying its own fresh
       actions.
+
+    `source_size_bytes`/`source_mtime` (Milestone 7C) snapshot the source
+    file's size/mtime at generation time -- included in
+    `_PLAN_CONTENT_COLUMNS` like every other content column, so a source
+    file that changes size or mtime between plan generations is treated
+    as a content change like any other: an APPROVED plan whose source has
+    since changed on the next regeneration goes SUPERSEDED, the same
+    mechanism a destination or verification change already triggers.
     """
     verification_json = _serialize_json(verification)
     blocking_reasons_json = _serialize_json(blocking_reasons)
@@ -297,6 +313,8 @@ def reconcile_plan(
         identification_candidate_id,
         media_identity_assignment_id,
         source_path,
+        source_size_bytes,
+        source_mtime,
         destination_library,
         destination_directory,
         destination_filename,
