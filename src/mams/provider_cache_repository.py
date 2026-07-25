@@ -19,7 +19,7 @@ resolution/ingest reconciliation.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 
@@ -82,6 +82,46 @@ def put_entry(
         (provider, request_key, endpoint, response_json, status_code, expires_at),
     )
     connection.commit()
+
+
+@dataclass(frozen=True)
+class CacheStats:
+    """Operator-facing provider_cache totals -- deliberately just row
+    counts, never response bodies (see the module docstring: a raw
+    provider response is the only thing this table stores, and it stays
+    that way here too)."""
+
+    total_count: int
+    fresh_count: int
+    expired_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def get_cache_stats(connection: sqlite3.Connection) -> CacheStats:
+    """Total/fresh/expired row counts across all providers. Two fixed
+    queries, never one per row. A row is "expired" by the same
+    `expires_at > CURRENT_TIMESTAMP` boundary `get_entry` uses to decide a
+    cache hit vs. miss -- consistent with that function's treatment of an
+    expired row as unreadable, not deleted."""
+    total = connection.execute("SELECT COUNT(*) AS n FROM provider_cache").fetchone()["n"]
+    expired = connection.execute(
+        "SELECT COUNT(*) AS n FROM provider_cache WHERE expires_at <= CURRENT_TIMESTAMP"
+    ).fetchone()["n"]
+    return CacheStats(total_count=total, fresh_count=total - expired, expired_count=expired)
+
+
+def clear_expired_entries(connection: sqlite3.Connection) -> int:
+    """Delete only rows whose `expires_at` has already passed. Touches
+    `provider_cache` alone -- no other table has a foreign key to it (see
+    the module docstring), so this can never affect external identities,
+    resolution attempts/assignments, or ingest plans. Commits immediately,
+    same as `put_entry` -- a cache mutation is never tied to a caller's
+    surrounding transaction."""
+    cursor = connection.execute("DELETE FROM provider_cache WHERE expires_at <= CURRENT_TIMESTAMP")
+    connection.commit()
+    return cursor.rowcount
 
 
 class SqliteCacheStore:

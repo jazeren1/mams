@@ -317,6 +317,69 @@ def test_build_cache_key_is_order_independent_and_drops_none() -> None:
     assert key_with_none == key_without
 
 
+# --- provider-status diagnostic (verify_credentials) --------------------------
+
+
+def test_verify_credentials_success() -> None:
+    session = FakeSession([FakeResponse(200, {"success": True, "status_code": 1, "status_message": "OK"})])
+    client, _ = _client(session)
+    assert client.verify_credentials() is None
+    assert session.calls[0]["url"].endswith("/authentication")
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_verify_credentials_invalid_token_raises(status_code: int) -> None:
+    session = FakeSession([FakeResponse(status_code)])
+    client, _ = _client(session)
+    with pytest.raises(TMDbAuthenticationError):
+        client.verify_credentials()
+
+
+def test_verify_credentials_rate_limited_raises() -> None:
+    session = FakeSession([FakeResponse(429)])
+    client, _ = _client(session)
+    with pytest.raises(TMDbRateLimitError):
+        client.verify_credentials()
+
+
+def test_verify_credentials_network_failure_raises() -> None:
+    session = FakeSession([requests.ConnectionError("boom")])
+    client, _ = _client(session)
+    with pytest.raises(TMDbConnectionError):
+        client.verify_credentials()
+
+
+def test_verify_credentials_timeout_raises() -> None:
+    session = FakeSession([requests.Timeout(), requests.Timeout()])
+    client, _ = _client(session)
+    with pytest.raises(TMDbTimeoutError):
+        client.verify_credentials()
+
+
+def test_verify_credentials_malformed_response_raises() -> None:
+    session = FakeSession([FakeResponse(200, _malformed=True)])
+    client, _ = _client(session)
+    with pytest.raises(TMDbResponseError):
+        client.verify_credentials()
+
+
+def test_verify_credentials_is_cached_on_repeat() -> None:
+    session = FakeSession([FakeResponse(200, {"success": True})])
+    client, cache = _client(session)
+    client.verify_credentials()
+    client.verify_credentials()
+    assert len(session.calls) == 1
+    assert len(cache.put_calls) == 1
+
+
+def test_verify_credentials_never_leaks_token() -> None:
+    session = FakeSession([FakeResponse(401)])
+    client, _ = _client(session)
+    with pytest.raises(TMDbAuthenticationError) as excinfo:
+        client.verify_credentials()
+    assert FAKE_TOKEN not in str(excinfo.value)
+
+
 # --- token never leaks ---------------------------------------------------------
 
 

@@ -227,6 +227,18 @@ class TMDbClient:
         )
         return payload
 
+    def verify_credentials(self) -> None:
+        """Validate the configured token with one minimal, cached, harmless
+        request against TMDb's `/authentication` endpoint -- it takes no
+        parameters and returns no meaningful data, existing solely to
+        confirm a token is accepted. Reuses `_get`'s existing error
+        handling: raises `TMDbAuthenticationError`/`TMDbRateLimitError`/
+        `TMDbTimeoutError`/`TMDbConnectionError`/`TMDbResponseError` for
+        the corresponding failure, or returns `None` on success. Subject to
+        the same cache as every other request (see `build_cache_key`), so
+        repeated diagnostic runs within the TTL cost no extra network call."""
+        self._get("/authentication", {})
+
     def search_movie(self, title: str, year: int | None = None) -> list[MovieResult]:
         payload = self._get("/search/movie", {"query": title, "year": year})
         results = (payload or {}).get("results")
