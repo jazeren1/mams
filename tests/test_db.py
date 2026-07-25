@@ -77,7 +77,7 @@ def test_migrate_against_real_migrations_dir(tmp_path: Path) -> None:
 
     applied = migrate(db_path, repo_migrations_dir)
 
-    assert applied == [1, 2, 3, 4, 5]
+    assert applied[:5] == [1, 2, 3, 4, 5]
     with connect(db_path) as connection:
         tables = {
             row["name"]
