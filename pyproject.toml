@@ -21,3 +21,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = [
+    "live: exercises the real TMDb API with a configured TMDB_API_TOKEN; excluded from the default run (see docs/INGEST-WORKFLOW.md). Run explicitly with `pytest -m live`.",
+]
