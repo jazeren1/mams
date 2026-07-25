@@ -19,6 +19,13 @@ layers of tables:
   unconfirmed movie or TV interpretation, persisted and reconciled by
   `mams identify evaluate`. Never calls TMDb/TVDB/Plex or any external
   service. See "`identification_candidates`" below.
+- **External identity resolution and dry-run ingest planning**
+  (`provider_cache`, `external_identities`, `resolution_attempts`,
+  `resolution_matches`, `media_identity_assignments`, `ingest_plans`,
+  `ingest_plan_actions`): resolves local identification candidates
+  against TMDb, persists ranked scored matches and confirmed identity
+  assignments, and generates structured dry-run ingest plans with
+  proposed (never executed) actions. See "Milestone 7B" below.
 
 Schema changes are versioned migrations under `database/migrations/`, never
 applied by hand to a deployed database. See "Migration strategy" below.
@@ -573,6 +580,142 @@ row becomes `IGNORED`, reconciliation never automatically flips it back to
 erase a user's explicit decision to suppress a finding they've already
 reviewed.
 
+## Milestone 7B: External Identity Resolution and Dry-Run Ingest Planning
+
+Seven tables, added across migrations `0006`-`0010`. TMDb is the only
+external provider. This milestone remains entirely read-only against the
+NAS and Plex: it never renames, moves, copies, deletes, or replaces
+media, and never creates a directory. Full rationale for every design
+choice below also lives in each migration file's header comment.
+
+### `provider_cache`
+
+A pure HTTP response cache for TMDb search/detail requests, keyed by
+`(provider, request_key)` where `request_key` is a deterministic digest
+of the endpoint and its normalized parameters (`tmdb.build_cache_key`).
+This is the **one** table in this milestone where a raw provider response
+is stored — everywhere else stores only the specific fields MAMS needs.
+A fresh fetch overwrites the row in place (it is a cache, not history);
+`expires_at` governs a TTL-based read-side expiry (`provider_cache_repository.get_entry`
+treats an expired row as a miss rather than deleting it).
+
+### `external_identities`
+
+A confirmed, provider-scoped movie/series/episode identity. Identity/
+uniqueness is `(provider, media_type, provider_id)` — TMDb's id
+namespaces are per-endpoint, not global, so a movie id and a TV id can
+collide numerically; `media_type` must be part of the natural key.
+`series_provider_id` denormalizes the TMDb show id onto an `EPISODE` row
+(rather than a foreign key to a `SERIES` row) so an episode identity is
+self-contained and never requires a `SERIES` row to exist first. TMDb has
+no dedicated "special" concept — a season-0 episode is stored as
+`media_type='EPISODE'`, `season_number=0`; `media_type='SPECIAL'` is
+reserved schema, unused by this milestone's TMDb resolution path. Rows
+are upserted (`resolution_repository.upsert_external_identity`) with the
+same no-churn discipline as `identification_candidates`: an unchanged
+re-resolution touches nothing.
+
+### `resolution_attempts` / `resolution_matches`
+
+One historical `resolution_attempts` row per evaluation of a local
+identification candidate against TMDb — append-only history, like
+`scan_changes`/`findings`, not reconciled in place like
+`identification_candidates`: a candidate can be re-evaluated
+(`resolve evaluate --force`) many times, and every attempt is kept.
+`identification_candidate_id`/`media_file_id` use `ON DELETE SET NULL`
+(evidence must outlive its subject, same reasoning as `scan_changes`).
+Every attempt reaches exactly one terminal status: `RESOLVED`,
+`REVIEW_REQUIRED`, `NO_MATCH`, `FAILED`, or `SKIPPED` (see "Resolution
+thresholds" below) — there is no `PENDING`-then-update lifecycle; the
+entire search+score computation happens before anything is persisted.
+
+`resolution_matches` holds the ranked, scored candidates returned for one
+attempt — "preserve the ranked alternatives used to make or review a
+decision." Owned child rows (`ON DELETE CASCADE`). `scoring_json` is a
+compact, deterministic encoding of `scoring.MatchScore`'s component
+breakdown and reasons — never the raw TMDb response. A partial unique
+index enforces at most one `selected=1` row per attempt.
+
+### `media_identity_assignments`
+
+Links a media file to the external identity confirmed for it
+(`AUTO` or `MANUAL`). Append-only history, like `resolution_attempts` —
+selecting a new identity supersedes the prior assignment
+(`status → SUPERSEDED`) rather than overwriting it in place, so "a local
+candidate and a confirmed external identity are different concepts"
+stays auditable across changes of mind. A partial unique index enforces
+at most one `ACTIVE` assignment per file. `assign_identity()` is a no-op
+when the current `ACTIVE` row already matches the requested
+`(external_identity_id, assignment_method, confidence)` — repeated
+evaluation with an unchanged outcome never creates duplicate history.
+
+### `ingest_plans` / `ingest_plan_actions`
+
+One current (non-`SUPERSEDED`) dry-run plan per media file, enforced by a
+partial unique index — the same at-most-one-current-row pattern as
+`media_identity_assignments`. Regenerating a plan against unchanged
+inputs updates the current row in place (no churn); regenerating against
+changed inputs also updates in place, **unless** the current row is
+`APPROVED`, in which case it is marked `SUPERSEDED` (an approval must
+never be silently mutated) and a new current plan is inserted.
+`SUPERSEDED` is a schema addition beyond the milestone's suggested status
+list, needed specifically for this rule (see `ingest_repository.reconcile_plan`
+for the exact comparison, which deliberately excludes `status` from the
+"did content change" check so a routine regeneration reaching the same
+`READY_FOR_REVIEW` conclusion never looks like a change merely because
+`status` isn't literally `"APPROVED"`).
+
+`ingest_plan_actions` holds an ordered, proposed-only action sequence,
+recreated wholesale whenever its parent plan's content is regenerated.
+Every action's `details_json` carries `{"execution_state":
+"PROPOSED_NOT_EXECUTED"}`; no executor exists anywhere in this codebase.
+
+### Incoming as a category
+
+`mams inventory scan` merges `AppConfig.incoming_categories` (synthesized
+from `ingest.incoming_roots` — `"incoming"` for a single configured root,
+`"incoming_1"`/`"incoming_2"`/... for more than one) into the categories
+it scans, alongside `nas.categories`. This required zero changes to
+`inventory.py`: it has always operated on a plain category-name →
+root-path mapping. `detect_layout()` reports `unknown` for these
+categories (Incoming files aren't movie/TV-folder-shaped), which routes
+`identification.evaluate_file()` through its existing `_parse_unclassified()`
+fallback — unchanged from Milestone 7A.
+
+**Known limitation**: `_parse_unclassified()`'s movie fallback requires a
+parsed year (an explicit, tested Milestone 7A behavior — see
+`test_unclassified_with_no_pattern_evidence_anywhere_is_unknown` — that
+this milestone deliberately does not weaken). A movie file with no
+parseable year, sitting directly in Incoming, is therefore parsed as
+`UNKNOWN` and skipped by resolution rather than reaching TMDb. A movie
+under an already-classified category (`movies`/`kids_movies`) is
+unaffected, since its layout alone routes it to the movie parser
+regardless of year. Working around this for Incoming specifically would
+require relaxing a protected 7A test; deferred rather than done
+casually — see "Known limitations" in the Milestone 7B validation entry.
+
+### Resolution thresholds (Phase E policy)
+
+Constants in `resolution_service.py`: `AUTO_RESOLVE_MIN_SCORE = 0.90`,
+`AUTO_RESOLVE_MIN_GAP = 0.10`, `MIN_PLAUSIBLE_SCORE = 0.60`.
+
+- **`RESOLVED` / `HIGH`**: top score ≥ 0.90, gap from the second-best
+  match ≥ 0.10, no provider-type conflict, and (movies) a known local
+  year, or (episodes) an exact season+episode match and a candidate that
+  isn't `SPECIAL`/`EXTRA`.
+- **`REVIEW_REQUIRED` / `MEDIUM`**: top score ≥ 0.60 but the auto-resolve
+  bar wasn't met.
+- **`NO_MATCH`**: no result reached 0.60, or TMDb returned nothing.
+- **`FAILED`**: a `tmdb.TMDbError` was raised.
+- **`SKIPPED`**: `candidate_type` is `UNKNOWN` (no usable query text) or
+  `EXTRA` (TMDb doesn't catalog bonus/deleted-scene content as a distinct
+  searchable entity) — TMDb is never queried for these. `SPECIAL`
+  candidates *are* searched but capped at `REVIEW_REQUIRED`.
+
+Provider popularity is never a scoring input (see `scoring.py`); movie
+result ranking uses it only as a final, documented tie-break when two
+results have an equal `total_score`.
+
 ## Primary keys
 
 `INTEGER AUTOINCREMENT` surrogates on all seven inventory tables. This
@@ -616,6 +759,31 @@ that linkage (a nullable `asset_id` on `media_files`, or a join table for
 multi-file assets) is deferred to a future migration once an
 identification milestone exists.
 
+**Milestone 7B additions:**
+
+- `resolution_attempts.identification_candidate_id → identification_candidates.id`,
+  `resolution_attempts.media_file_id → media_files.id` (`ON DELETE SET NULL` —
+  evidence must outlive its subject, same reasoning as `scan_changes`/`findings`)
+- `resolution_attempts.selected_match_id → resolution_matches.id`
+  (`ON DELETE SET NULL`; a forward reference to a table defined later in
+  the same migration file — safe in SQLite, which only resolves FK targets
+  at DML time, not at `CREATE TABLE` time)
+- `resolution_matches.resolution_attempt_id → resolution_attempts.id`
+  (`ON DELETE CASCADE` — owned child rows, same reasoning as the track tables)
+- `media_identity_assignments.media_file_id → media_files.id` (`ON DELETE CASCADE`),
+  `media_identity_assignments.identification_candidate_id → identification_candidates.id`
+  (`ON DELETE SET NULL`), `media_identity_assignments.external_identity_id → external_identities.id`
+  (no `ON DELETE` clause — nothing deletes an external identity),
+  `media_identity_assignments.resolution_attempt_id → resolution_attempts.id` (`ON DELETE SET NULL`)
+- `ingest_plans.media_file_id → media_files.id` (`ON DELETE CASCADE`),
+  `ingest_plans.identification_candidate_id → identification_candidates.id`
+  (`ON DELETE SET NULL`), `ingest_plans.media_identity_assignment_id → media_identity_assignments.id`
+  (`ON DELETE SET NULL`)
+- `ingest_plan_actions.ingest_plan_id → ingest_plans.id` (`ON DELETE CASCADE` —
+  owned child rows, recreated wholesale on every plan regeneration)
+- `provider_cache` has no foreign keys — a pure HTTP cache has no
+  relationship to any other table.
+
 ## Required indexes
 
 ```sql
@@ -654,6 +822,41 @@ CREATE INDEX idx_identification_candidates_type ON identification_candidates(can
 CREATE INDEX idx_identification_candidates_confidence ON identification_candidates(confidence);
 CREATE INDEX idx_identification_candidates_season_number ON identification_candidates(season_number);
 CREATE INDEX idx_identification_candidates_parsed_year ON identification_candidates(parsed_year);
+
+-- Milestone 7B (database/migrations/0006-0010) -- see each file for the
+-- full identity/uniqueness/FK rationale summarized above.
+CREATE UNIQUE INDEX idx_provider_cache_provider_request_key ON provider_cache(provider, request_key);
+CREATE INDEX idx_provider_cache_expires_at ON provider_cache(expires_at);
+
+CREATE UNIQUE INDEX idx_external_identities_provider_type_id ON external_identities(provider, media_type, provider_id);
+CREATE INDEX idx_external_identities_series_provider_id ON external_identities(series_provider_id);
+CREATE INDEX idx_external_identities_media_type ON external_identities(media_type);
+CREATE INDEX idx_external_identities_release_year ON external_identities(release_year);
+
+CREATE INDEX idx_resolution_attempts_candidate_id ON resolution_attempts(identification_candidate_id);
+CREATE INDEX idx_resolution_attempts_media_file_id ON resolution_attempts(media_file_id);
+CREATE INDEX idx_resolution_attempts_status ON resolution_attempts(status);
+CREATE INDEX idx_resolution_attempts_started_at ON resolution_attempts(started_at);
+
+CREATE UNIQUE INDEX idx_resolution_matches_attempt_rank ON resolution_matches(resolution_attempt_id, rank);
+CREATE UNIQUE INDEX idx_resolution_matches_attempt_provider_id ON resolution_matches(resolution_attempt_id, provider_media_type, provider_id);
+CREATE UNIQUE INDEX idx_resolution_matches_one_selected_per_attempt ON resolution_matches(resolution_attempt_id) WHERE selected = 1;
+CREATE INDEX idx_resolution_matches_attempt_id ON resolution_matches(resolution_attempt_id);
+CREATE INDEX idx_resolution_matches_series_provider_id ON resolution_matches(series_provider_id);
+
+CREATE UNIQUE INDEX idx_media_identity_assignments_active_media_file ON media_identity_assignments(media_file_id) WHERE status = 'ACTIVE';
+CREATE INDEX idx_media_identity_assignments_media_file_id ON media_identity_assignments(media_file_id);
+CREATE INDEX idx_media_identity_assignments_external_identity_id ON media_identity_assignments(external_identity_id);
+CREATE INDEX idx_media_identity_assignments_status ON media_identity_assignments(status);
+CREATE INDEX idx_media_identity_assignments_resolution_attempt_id ON media_identity_assignments(resolution_attempt_id);
+
+CREATE UNIQUE INDEX idx_ingest_plans_current_media_file ON ingest_plans(media_file_id) WHERE status != 'SUPERSEDED';
+CREATE INDEX idx_ingest_plans_media_file_id ON ingest_plans(media_file_id);
+CREATE INDEX idx_ingest_plans_status ON ingest_plans(status);
+CREATE INDEX idx_ingest_plans_destination_library ON ingest_plans(destination_library);
+
+CREATE UNIQUE INDEX idx_ingest_plan_actions_plan_order ON ingest_plan_actions(ingest_plan_id, action_order);
+CREATE INDEX idx_ingest_plan_actions_plan_id ON ingest_plan_actions(ingest_plan_id);
 ```
 
 ## Migration strategy

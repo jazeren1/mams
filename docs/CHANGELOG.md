@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.6.0
+
+Added Milestone 7B: external identity resolution against TMDb and
+dry-run ingest planning. Seven new tables (`provider_cache`,
+`external_identities`, `resolution_attempts`, `resolution_matches`,
+`media_identity_assignments`, `ingest_plans`, `ingest_plan_actions`).
+
+`mams resolve evaluate` searches TMDb for each local identification
+candidate (movie search by title+year, or TV series search followed by
+an episode lookup), scores every result deterministically
+(`scoring.py`: normalized title similarity, exact/close/missing year,
+season/episode exactness, episode-title corroboration, runtime
+corroboration -- provider popularity is never a scoring input, only a
+documented final tie-break), and persists one historical
+`resolution_attempts` row with its ranked `resolution_matches`. A top
+score >= 0.90 with a >= 0.10 gap and no conflicts auto-resolves
+(`HIGH` confidence); a plausible but ambiguous result requires review;
+nothing plausible is `NO_MATCH`; a provider error is `FAILED`; a local
+candidate that's `UNKNOWN` or `EXTRA` is `SKIPPED` without ever querying
+TMDb. `mams resolve list/show/select/reject/stats` provide read-only
+browsing plus non-destructive manual review -- selecting or rejecting a
+match never touches media, preserves every ranked alternative, and
+never creates duplicate assignment history for an unchanged outcome.
+Confirmed identities are stored in `external_identities`, separate from
+both the local candidate and the `media_identity_assignments` row that
+links a file to one (`AUTO`/`MANUAL`, superseded rather than overwritten
+when the confirmed identity changes).
+
+`mams ingest plan MEDIA_FILE_ID` generates a structured dry-run plan for
+one file under a configured `ingest.incoming_roots` root: verifies basic
+media health from already-collected MediaInfo data (`verification.py`,
+narrowly phrased as "structurally plausible," never "confirmed
+uncorrupted"), computes a canonical destination path
+(`destination.py`, sanitized against path traversal, reserved names, and
+Unicode inconsistencies), and checks for collisions against canonical
+inventory, other active plans, and the filesystem (a read-only
+existence check only). A plan is `BLOCKED` on an unresolved identity,
+failed verification, or a collision; `REVIEW_REQUIRED` when no
+destination category was given, the identity was manually selected, or
+verification only warned; otherwise `READY_FOR_REVIEW`. Every plan
+prints "No actions were executed"; every proposed action
+(`VALIDATE_SOURCE`/`VERIFY_MEDIA`/`CREATE_DIRECTORY`/`MOVE`/`RENAME`/
+`REFRESH_INVENTORY`/`REQUEST_PLEX_REFRESH`) is tagged
+`PROPOSED_NOT_EXECUTED`; no executor exists anywhere in this codebase.
+`mams ingest approve PLAN_ID` flips a `READY_FOR_REVIEW` plan to
+`APPROVED` as a database-only state change.
+
+Incoming files are scanned into the existing canonical inventory as
+additional categories (`AppConfig.incoming_categories`, merged into
+`mams inventory scan` alongside the NAS categories) -- no changes to
+`inventory.py` itself. This milestone never renames, moves, copies,
+deletes, or replaces a media file, and never creates a directory or
+calls Plex. Requires a TMDb API token (`TMDB_API_TOKEN` by default,
+configurable via `tmdb.token_env_var`); every existing command continues
+to work with no token configured.
+
 ## 0.5.0
 
 Added a deterministic local parsing layer: `mams identify evaluate` parses

@@ -10,3 +10,17 @@
 - D-008: Music is out of scope for version 1.
 - D-009: The Mac is staging only; permanent storage belongs on the NAS.
 - D-010: Plex scans and path verification are enough for initial integration.
+- D-011: TMDb is the only external identity provider for Milestone 7B;
+  TVDB/IMDb/OMDb/Plex metadata are explicitly deferred.
+- D-012: MAMS never infers kids-vs-adult library classification from
+  TMDb genre data; the destination category is always an explicit
+  human input, defaulting to REVIEW_REQUIRED when omitted.
+- D-013: A movie's local year is required for auto-resolution; a movie
+  or episode identity may still be manually confirmed without one.
+- D-014: Confirmed external identities, local identification candidates,
+  resolution attempts/matches, and dry-run ingest plans are four
+  separate concepts, never merged into one table -- a local candidate
+  never becomes a confirmed identity by being overwritten in place.
+- D-015: Dry-run ingest planning computes proposed actions but performs
+  none; approval is a database state change only until a future
+  milestone implements an executor.

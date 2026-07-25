@@ -626,6 +626,202 @@ underlying media.
 
 ---
 
+# Milestone 7B – External Identity Resolution and Dry-Run Ingest Planning
+
+## Summary
+
+Resolves Milestone 7A's local `identification_candidates` against TMDb,
+persists ranked scored matches and confirmed external identities, and
+generates structured dry-run ingest plans with proposed (never executed)
+actions. Seven new tables across migrations `0006`-`0010`. No NAS file,
+directory, or Plex state was changed by any command exercised during
+this validation.
+
+## Validation Results
+
+- 826 automated tests passing (up from 504 at the end of Milestone 7A),
+  covering schema constraints/uniqueness/FK retention for all seven new
+  tables, the TMDb client (auth/rate-limit/timeout/connection/malformed-
+  response handling, cache hit/miss/expiry, token-never-leaks),
+  deterministic movie/episode scoring (exact/close/missing year,
+  alternate-title matching, runtime corroboration, popularity-never-
+  overrides), the resolution lifecycle (auto-resolve, review-required,
+  no-match, failed, skipped, manual select/reject, assignment
+  supersede/no-duplicate), verification, destination naming (including
+  sanitization and path-traversal rejection), ingest plan reconciliation
+  (no-churn regeneration, approved-plan supersede-on-change), and the
+  full `resolve`/`ingest` CLI surface.
+- Ruff clean, MyPy clean across all 23 source modules.
+
+## Sandbox Demonstration
+
+Ran the full pipeline (`inventory scan` → `identify evaluate` →
+`resolve evaluate` → `resolve select`/`reject` → `ingest plan` →
+`ingest approve`) through the real CLI entry points against a sandbox
+`Incoming` directory, with a fake `MediaProvider` injected in place of
+`resolution_service.build_provider` so no real network call was made and
+every result is deterministic and reproducible. Fixtures:
+
+1. **`Alien (1979).mkv`** — clearly named movie with year. Parsed `MOVIE`
+   candidate (`HIGH` confidence) → TMDb search returned one exact
+   title+year match → **auto-resolved, `RESOLVED`/`HIGH`**. After
+   simulating a healthy MediaInfo probe (duration, one video track, one
+   audio track — the real scanner never invokes `mediainfo` on these
+   zero-content fixture files), `ingest plan --destination-category
+   movie` produced a **`READY_FOR_REVIEW`** plan with destination
+   `NAS/Movies/Alien (1979)/Alien (1979).mkv` and all six proposed
+   actions (`VALIDATE_SOURCE` → `VERIFY_MEDIA` → `CREATE_DIRECTORY` →
+   `MOVE` → `REFRESH_INVENTORY` → `REQUEST_PLEX_REFRESH`), each printed
+   `(PROPOSED -- NOT EXECUTED)`. Regenerating the same plan a second time
+   produced the identical `id` and identical `updated_at` — no churn.
+   `ingest approve` flipped it to `APPROVED` and printed "Plan approved.
+   No actions executed."
+2. **`The Fifth Element.mkv`** — movie without a year, in Incoming
+   (an unclassified category). Parsed `UNKNOWN`/`UNKNOWN` — demonstrates
+   the documented Milestone 7A boundary (see "Known Limitations" below),
+   not a bug. `resolve evaluate` correctly **`SKIPPED`** it without
+   ever querying TMDb.
+3. **`Total Recall (1990).mkv`** — ambiguous movie title. The fake
+   provider returned two distinct TMDb entries with identical title/year
+   (simulating a real-world data-quality ambiguity, e.g. original vs.
+   remake metadata collision), producing a zero score gap →
+   **`REVIEW_REQUIRED`/`MEDIUM`**, both alternatives ranked and
+   persisted. `resolve select ATTEMPT_ID MATCH_ID` manually confirmed
+   the first match → attempt flipped to `RESOLVED`, `MANUAL`
+   assignment created, second alternative preserved untouched. A
+   forced re-evaluation (`--force`) produced a **new** historical
+   attempt (old one preserved), which `resolve reject` marked
+   **`NO_MATCH`**, creating no assignment and preserving both
+   alternatives.
+4. **`Breaking Bad - S01E01.mkv`** — standard TV episode. Parsed
+   `EPISODE` S01E01 → TMDb series search + episode lookup matched
+   exactly → **auto-resolved, `RESOLVED`/`HIGH`**.
+5. **`Breaking Bad - S01E02-E03.mkv`** — multi-episode file. Parsed
+   `EPISODE` with `episode_numbers=(2, 3)` → resolved against its
+   primary episode (S01E02) → **`RESOLVED`/`HIGH`** (see "Known
+   Limitations": resolution matches the primary episode number only,
+   not a merged two-episode identity).
+6. **`Corrupt Movie (2020).mkv`** — zero-byte file. Parsed `MOVIE`
+   (`HIGH` confidence — the filename alone is well-formed). TMDb search
+   for this title returned no results → **`NO_MATCH`**, no assignment
+   created. Separately, `ingest plan` on this file (after simulating a
+   probe with zero size and no tracks) produced a **`BLOCKED`** plan
+   with `verification_status=FAIL` (`non_zero_size`, `duration_present`,
+   `video_track_present` all `FAIL`) and reason "no resolved ACTIVE
+   external identity assignment exists for this file" — both a
+   verification block and an identity block demonstrated on the same
+   file.
+
+Every scenario in the milestone's validation checklist was demonstrated:
+automatic resolution, review-required resolution, no-match, manual match
+selection, manual rejection, verification pass, verification block,
+ready-for-review plan, blocked plan, and deterministic plan regeneration.
+
+**Safety confirmation**: after the full run, `NAS/Movies` did not exist
+on disk (no directory was created), the source file at
+`Incoming/Alien (1979).mkv` was still present and unmodified, and no
+Plex request was made (no such call exists anywhere in this milestone's
+code).
+
+## Live TMDb Validation
+
+Not performed. No `TMDB_API_TOKEN` was configured in this environment.
+Per the milestone's own instructions, sandbox validation with a fake
+provider was performed instead, and the "no token configured" path was
+verified separately: `resolve evaluate` prints a clear error
+("No TMDb API token configured...") and creates no `resolution_attempts`
+row at all, while `inventory scan`/`identify evaluate` (and every other
+existing command) are completely unaffected. Separately, during
+interactive CLI smoke testing, `resolve evaluate` was run once against
+the **real** TMDb API with a deliberately invalid token — TMDb's actual
+401 response was correctly handled end-to-end (`FAILED` attempt,
+`error_message="TMDb rejected the configured API token"`, no crash),
+confirming the HTTP error-handling path against a live endpoint even
+without full auto-resolution validation. Live validation of actual
+search/match results against 5 known movies, 5 known episodes, and 2
+intentionally ambiguous titles is deferred until a real token is
+configured, per the milestone's own conservative default (do not run
+external resolution across the full production library without
+explicit approval).
+
+## Known Limitations
+
+- **Year-less movies in Incoming are `UNKNOWN`, not `MOVIE`.**
+  `identification._parse_unclassified()`'s movie fallback requires a
+  parsed year — an explicit, tested Milestone 7A behavior
+  (`test_unclassified_with_no_pattern_evidence_anywhere_is_unknown`)
+  that this milestone deliberately does not weaken, since relaxing it
+  would also start accepting bare, un-classified titles like `readme`
+  as low-confidence movies. A year-less movie under an already-classified
+  category (`movies`/`kids_movies`) is unaffected — its layout alone
+  routes it to the movie parser regardless of year. Confirmed with the
+  full existing local-parsing test suite still passing unchanged.
+- **Multi-episode files resolve against their primary episode only.**
+  TMDb's episode-detail endpoint addresses one episode at a time;
+  `resolution_service._search_and_score_episodes()` resolves and scores
+  against `episode_number` (the first of a multi-episode file's
+  `episode_numbers`), not a merged two-episode identity. The resulting
+  `external_identities`/`media_identity_assignments` row and destination
+  filename (`S01E02-E03`) are still correct for the *file*, but a
+  second, distinct external identity for episode 3 is never separately
+  recorded.
+- **No fuzzy "possible edition collision" detection.** Phase J's
+  collision analysis checks for exact destination-path collisions
+  (filesystem, canonical inventory, another active plan) but does not
+  attempt to detect a *different* edition/cut of the same title already
+  present under a similar-but-not-identical path — this would require
+  path-similarity heuristics not implemented in this milestone.
+- **Popularity-based tie-breaking is movie-only.** Episode ranking has
+  no popularity tie-break (TMDb exposes no meaningful per-episode
+  popularity distinct from its series); ties there are broken by
+  provider id alone, which is deterministic but arbitrary.
+- **`resolve evaluate`'s default `--limit` (10) is a safety valve, not a
+  tuned value.** Chosen because each evaluation costs a real TMDb
+  request (unlike free local `identify evaluate`); a future milestone
+  running resolution across a large backlog will need explicit
+  `--limit`/scripted batching.
+
+## Quality Gates
+
+- 826 automated tests passing
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This milestone's core risk was different from every prior one: it is the
+first to reach outside MAMS (TMDb) and the first to *compute* proposed
+file operations rather than only observe read-only state. Both risks
+were addressed structurally rather than through validation alone —
+`tmdb.py` normalizes every response before it reaches scoring/resolution
+code (no raw provider JSON leaks past the client), `provider_cache` is
+architecturally separate from canonical identity storage, and no
+executor exists anywhere in this codebase for `ingest_plan_actions`, so
+there is no code path capable of turning a proposed `MOVE` into a real
+one. The sandbox run's safety confirmation (no directory created, source
+file untouched, plan regeneration idempotent) is direct evidence that
+boundary holds in practice, not just in code review.
+
+Confirmed external identities, local identification candidates,
+resolution attempts/matches, and dry-run ingest plans remain four
+separate concepts throughout, exactly as designed: `The Fifth Element`'s
+`UNKNOWN` local candidate never became a confirmed identity by mistake;
+`Total Recall`'s two ambiguous TMDb entries were never silently
+collapsed into an automatic pick; and the `Corrupt Movie` fixture was
+independently blocked by verification *and* by having no confirmed
+identity, each for its own visible, structured reason.
+
+This milestone remains entirely read-only against the NAS and Plex — no
+rename, move, copy, delete, replace, directory creation, or Plex call
+exists anywhere in this codebase yet. It demonstrates that a local
+identification candidate can now be resolved into a confirmed external
+identity (automatically or with human review), verified for basic
+health, and turned into a fully-specified, human-reviewable dry-run plan
+— without any risk to the underlying media, and without ever executing
+that plan.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.
