@@ -19,6 +19,7 @@ from mams.cli import (
     build_parser,
     run_identify_evaluate,
     run_ingest_approve,
+    run_ingest_audit,
     run_ingest_plan,
     run_ingest_plans,
     run_ingest_show,
@@ -290,3 +291,85 @@ def test_run_ingest_approve_unknown_plan(tmp_path: Path, capsys: pytest.CaptureF
 
     assert result is None
     assert "No ingest plan" in capsys.readouterr().out
+
+
+# --- audit (Milestone 7C, Phase F) ----------------------------------------------
+
+
+def test_parser_accepts_audit_flags() -> None:
+    args = build_parser().parse_args(["ingest", "audit", "1", "--json"])
+    assert args.ingest_command == "audit"
+    assert args.plan_id == 1
+    assert args.json is True
+
+
+def test_run_ingest_audit_ready_for_executor(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _seed_and_resolve(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    run_ingest_approve(config, plan.id)
+    capsys.readouterr()
+
+    result = run_ingest_audit(config, plan.id)
+
+    assert result is not None
+    assert result.readiness_status.value == "READY_FOR_EXECUTOR"
+    out = capsys.readouterr().out
+    assert "MAMS Execution-Readiness Audit" in out
+    assert f"Plan #{plan.id}" in out
+    assert "Status: READY_FOR_EXECUTOR" in out
+    assert "EXECUTION WAS NOT PERFORMED." in out
+
+
+def test_run_ingest_audit_unapproved_plan_is_blocked(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _seed_and_resolve(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    assert plan.status == "READY_FOR_REVIEW"
+    capsys.readouterr()
+
+    result = run_ingest_audit(config, plan.id)
+
+    assert result is not None
+    assert result.readiness_status.value == "BLOCKED"
+    assert "Status: BLOCKED" in capsys.readouterr().out
+
+
+def test_run_ingest_audit_unknown_plan_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    incoming_root = tmp_path / "Incoming"
+    incoming_root.mkdir(parents=True)
+    config = load_config(_write_config(tmp_path, incoming_root=incoming_root, nas_root=tmp_path / "NAS"))
+    migrate(config.database_path)
+
+    result = run_ingest_audit(config, 999999)
+
+    assert result is None
+    assert "No ingest plan" in capsys.readouterr().out
+
+
+def test_run_ingest_audit_json_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _seed_and_resolve(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    run_ingest_approve(config, plan.id)
+    capsys.readouterr()
+
+    result = run_ingest_audit(config, plan.id, json_output=True)
+
+    assert result is not None
+    out = capsys.readouterr().out
+    assert '"execution_status": "NOT_EXECUTED"' in out
+    assert '"readiness_status": "READY_FOR_EXECUTOR"' in out
+    assert '"checks"' in out
+
+
+def test_run_ingest_audit_always_reports_all_checks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _seed_and_resolve(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    capsys.readouterr()
+
+    result = run_ingest_audit(config, plan.id)
+
+    assert result is not None
+    assert len(result.checks) == 25

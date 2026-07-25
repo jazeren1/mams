@@ -15,8 +15,11 @@ from . import identification_repository
 from . import identification_service
 from . import ingest_repository
 from . import ingest_service
+from . import provider_cache_repository
+from . import readiness
 from . import resolution_repository
 from . import resolution_service
+from .tmdb import TMDbAuthenticationError, TMDbConnectionError, TMDbRateLimitError, TMDbResponseError, TMDbTimeoutError
 console = Console()
 
 DEFAULT_INVENTORY_REPORT = "reports/library.json"
@@ -161,6 +164,43 @@ def build_parser() -> argparse.ArgumentParser:
     show_identify_parser.add_argument("candidate_id", type=int)
     show_identify_parser.add_argument("--json", action="store_true")
 
+    override_identify_parser = identify_subs.add_parser(
+        "override",
+        help="Manually set the effective identification for a media file. Database-only; the parsed "
+        "candidate is preserved untouched. Replaces any existing active override for the same file.",
+    )
+    override_identify_parser.add_argument("media_file_id", type=int)
+    override_identify_parser.add_argument(
+        "--type", dest="candidate_type", type=str.upper, choices=["MOVIE", "EPISODE"], required=True
+    )
+    override_identify_parser.add_argument("--title", default=None, help="Required for --type MOVIE.")
+    override_identify_parser.add_argument("--year", type=int, default=None)
+    override_identify_parser.add_argument("--series", dest="series_title", default=None, help="Required for --type EPISODE.")
+    override_identify_parser.add_argument(
+        "--season", dest="season_number", type=int, default=None, help="Required for --type EPISODE."
+    )
+    override_identify_parser.add_argument(
+        "--episode", dest="episode_number", type=int, default=None, help="Required for --type EPISODE."
+    )
+    override_identify_parser.add_argument("--episode-title", dest="episode_title", default=None)
+    override_identify_parser.add_argument("--reason", default=None, help="Optional free-text note on why this override exists.")
+    override_identify_parser.add_argument("--json", action="store_true")
+
+    clear_override_identify_parser = identify_subs.add_parser(
+        "clear-override",
+        help="Clear the active override for a media file. Effective identification reverts to the parsed candidate.",
+    )
+    clear_override_identify_parser.add_argument("media_file_id", type=int)
+    clear_override_identify_parser.add_argument("--json", action="store_true")
+
+    show_effective_identify_parser = identify_subs.add_parser(
+        "show-effective",
+        help="Show the identification resolution/planning will actually use for a file: an active "
+        "override if one exists, else the parsed candidate. Read-only.",
+    )
+    show_effective_identify_parser.add_argument("media_file_id", type=int)
+    show_effective_identify_parser.add_argument("--json", action="store_true")
+
     resolve_parser = subs.add_parser("resolve")
     resolve_subs = resolve_parser.add_subparsers(dest="resolve_command", required=True)
 
@@ -212,6 +252,24 @@ def build_parser() -> argparse.ArgumentParser:
     stats_resolve_parser = resolve_subs.add_parser("stats", help="Show resolution attempt statistics. Read-only.")
     stats_resolve_parser.add_argument("--json", action="store_true")
 
+    provider_status_parser = resolve_subs.add_parser(
+        "provider-status",
+        help="Check TMDb configuration/authentication with one minimal, cached request. Never prints the token.",
+    )
+    provider_status_parser.add_argument("--json", action="store_true")
+
+    cache_stats_parser = resolve_subs.add_parser("cache-stats", help="Show provider_cache statistics. Read-only.")
+    cache_stats_parser.add_argument("--json", action="store_true")
+
+    cache_clear_parser = resolve_subs.add_parser(
+        "cache-clear", help="Delete expired provider_cache rows. Never touches external identities, assignments, or plans."
+    )
+    cache_clear_parser.add_argument(
+        "--expired-only", action="store_true", required=True,
+        help="Required: only expired rows are ever deleted; there is no broader cache-clear.",
+    )
+    cache_clear_parser.add_argument("--json", action="store_true")
+
     ingest_parser = subs.add_parser("ingest")
     ingest_subs = ingest_parser.add_subparsers(dest="ingest_command", required=True)
 
@@ -246,6 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve_ingest_parser.add_argument("plan_id", type=int)
     approve_ingest_parser.add_argument("--json", action="store_true")
+
+    audit_ingest_parser = ingest_subs.add_parser(
+        "audit",
+        help="Read-only execution-readiness audit for an approved dry-run plan. Never executes anything.",
+    )
+    audit_ingest_parser.add_argument("plan_id", type=int)
+    audit_ingest_parser.add_argument("--json", action="store_true")
 
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
@@ -959,6 +1024,171 @@ def run_identify_show(
     return record
 
 
+def _render_override_text(override: identification_repository.OverrideRecord) -> str:
+    lines = [f"Override #{override.id}", "=" * len(f"Override #{override.id}")]
+    lines.append(f"Media file: {override.media_file_id}")
+    lines.append(f"Type:       {override.candidate_type}")
+    if override.candidate_type == "MOVIE":
+        label = override.title or "(no title)"
+        if override.year is not None:
+            label += f" ({override.year})"
+        lines.append(f"Identity:   {label}")
+    else:
+        series = override.series_title or "(no series)"
+        if override.season_number is not None and override.episode_numbers:
+            episodes = "".join(f"E{n:02d}" for n in override.episode_numbers)
+            label = f"{series} S{override.season_number:02d}{episodes}"
+        else:
+            label = series
+        if override.episode_title:
+            label += f" - {override.episode_title}"
+        lines.append(f"Identity:   {label}")
+    if override.reason:
+        lines.append(f"Reason:     {override.reason}")
+    lines.append(f"Created:    {override.created_at}")
+    if override.cleared_at:
+        lines.append(f"Cleared:    {override.cleared_at}")
+    return "\n".join(lines)
+
+
+def run_identify_override(
+    config: AppConfig,
+    media_file_id: int,
+    *,
+    candidate_type: str,
+    title: str | None = None,
+    year: int | None = None,
+    series_title: str | None = None,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+    episode_title: str | None = None,
+    reason: str | None = None,
+    json_output: bool = False,
+) -> identification_repository.OverrideRecord | None:
+    """Create (or replace) the active manual override for a media file.
+    Database-only: never renames or touches the file, never modifies the
+    parsed identification_candidates row. Returns None (after printing a
+    clear error, mutating nothing) for an unknown media_file_id or a
+    request missing a field its --type requires."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        media_file = inventory_repository.get_media_file(connection, media_file_id)
+        if media_file is None:
+            console.print(f"[red]No media file with id {media_file_id}.[/red]")
+            return None
+        try:
+            with connection:
+                override = identification_repository.create_override(
+                    connection,
+                    media_file_id=media_file_id,
+                    candidate_type=candidate_type,
+                    title=title,
+                    year=year,
+                    series_title=series_title,
+                    season_number=season_number,
+                    episode_numbers=(episode_number,) if episode_number is not None else None,
+                    episode_title=episode_title,
+                    reason=reason,
+                )
+        except identification_repository.InvalidOverrideError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=override.to_dict())
+    else:
+        console.print(f"[green]Override created for media file {media_file_id}.[/green]")
+        console.print(_render_override_text(override))
+    return override
+
+
+def run_identify_clear_override(
+    config: AppConfig, media_file_id: int, *, json_output: bool = False
+) -> identification_repository.OverrideRecord | None:
+    """Clear the active override for a media file, if any. Effective
+    identification reverts to the current parsed candidate. Returns None
+    (after printing a message, mutating nothing) for an unknown
+    media_file_id or when no override is currently active."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        media_file = inventory_repository.get_media_file(connection, media_file_id)
+        if media_file is None:
+            console.print(f"[red]No media file with id {media_file_id}.[/red]")
+            return None
+        with connection:
+            cleared = identification_repository.clear_override(connection, media_file_id)
+    finally:
+        connection.close()
+
+    if cleared is None:
+        console.print(f"No active override for media file {media_file_id}; nothing to clear.")
+        return None
+    if json_output:
+        console.print_json(data=cleared.to_dict())
+    else:
+        console.print(
+            f"[yellow]Override cleared for media file {media_file_id}.[/yellow] "
+            "Effective identification now reverts to the parsed candidate."
+        )
+    return cleared
+
+
+def _render_effective_candidate_text(effective: identification_repository.EffectiveCandidate) -> str:
+    lines = [f"Effective Identification -- Media File #{effective.media_file_id}", "=" * 46]
+    lines.append(f"Source:     {effective.source}")
+    lines.append(f"Type:       {effective.candidate_type}")
+    if effective.candidate_type == "MOVIE":
+        label = effective.parsed_title or "(unparsed)"
+        if effective.parsed_year is not None:
+            label += f" ({effective.parsed_year})"
+        lines.append(f"Identity:   {label}")
+    elif effective.candidate_type in ("EPISODE", "SPECIAL"):
+        series = effective.parsed_series_title or "(unknown series)"
+        if effective.season_number is not None and effective.episode_numbers:
+            episodes = "".join(f"E{n:02d}" for n in effective.episode_numbers)
+            label = f"{series} S{effective.season_number:02d}{episodes}"
+        else:
+            label = series
+        if effective.episode_title:
+            label += f" - {effective.episode_title}"
+        lines.append(f"Identity:   {label}")
+    lines.append(f"Confidence: {effective.confidence}")
+    if effective.override_id is not None:
+        lines.append(f"Override:   #{effective.override_id}")
+    return "\n".join(lines)
+
+
+def run_identify_show_effective(
+    config: AppConfig, media_file_id: int, *, json_output: bool = False
+) -> identification_repository.EffectiveCandidate | None:
+    """Show the identification resolution/planning will actually use for a
+    file right now: its active override if one exists, else its parsed
+    candidate. Read-only. Returns None (after printing a clear error) if
+    neither exists yet."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        effective = identification_repository.get_effective_candidate(connection, media_file_id)
+    finally:
+        connection.close()
+
+    if effective is None:
+        console.print(
+            f"[red]No identification candidate for media file {media_file_id}. "
+            "Run 'mams identify evaluate' first.[/red]"
+        )
+        return None
+    if json_output:
+        console.print_json(data=effective.to_dict())
+    else:
+        console.print(_render_effective_candidate_text(effective))
+    return effective
+
+
 def run_resolve_evaluate(
     config: AppConfig,
     *,
@@ -1005,9 +1235,22 @@ def run_resolve_evaluate(
         for candidate in candidates:
             media_file = inventory_repository.get_media_file(connection, candidate.media_file_id)
             local_runtime = media_file.duration_seconds if media_file is not None else None
+            # Resolve against the effective candidate (an active manual
+            # override, if any, else the plain parsed candidate) -- see
+            # identification_repository.get_effective_candidate (Milestone
+            # 7C, Phase D). `candidate` (the parsed row) still supplies the
+            # attempt's id/media_file_id FK columns either way.
+            effective = identification_repository.get_effective_candidate(connection, candidate.media_file_id)
+            effective_ic = identification_repository.to_identification_candidate(effective) if effective else None
+            override_id = effective.override_id if effective is not None else None
             attempts.append(
                 resolution_service.evaluate_candidate(
-                    connection, provider, candidate_record=candidate, local_runtime_seconds=local_runtime
+                    connection,
+                    provider,
+                    candidate_record=candidate,
+                    local_runtime_seconds=local_runtime,
+                    effective_candidate=effective_ic,
+                    override_id=override_id,
                 )
             )
     finally:
@@ -1195,6 +1438,115 @@ def run_resolve_stats(config: AppConfig, *, json_output: bool = False) -> resolu
     return stats
 
 
+def _render_provider_status_text(result: dict[str, object]) -> str:
+    lines = ["TMDb Provider Status", "=" * 21, ""]
+    lines.append(f"Configured: {'yes' if result['configured'] else 'no'}")
+    if result.get("authentication") is not None:
+        lines.append(f"Authentication: {result['authentication']}")
+    if result.get("cache_available") is not None:
+        lines.append(f"Cache: {'available' if result['cache_available'] else 'unavailable'}")
+    if result.get("network_ok") is not None:
+        lines.append(f"Network request: {'successful' if result['network_ok'] else 'failed'}")
+    lines.append(f"Provider: {result['provider']}")
+    if result.get("error"):
+        lines.append("")
+        lines.append(str(result["error"]))
+    return "\n".join(lines)
+
+
+def run_resolve_provider_status(config: AppConfig, *, json_output: bool = False) -> dict[str, object]:
+    """Diagnose TMDb configuration/authentication with at most one minimal,
+    cached HTTP request (`TMDbClient.verify_credentials`). Never prints,
+    logs, or returns the token itself -- distinguishes not-configured,
+    invalid token, rate limited, network failure, malformed response, and
+    success. Applies pending migrations first (a cache-backed provider
+    needs a database), but writes nothing beyond whatever
+    `verify_credentials()` itself caches."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        result: dict[str, object] = {"provider": "TMDb", "configured": config.tmdb_token is not None}
+        if not result["configured"]:
+            result["authentication"] = None
+            result["cache_available"] = None
+            result["network_ok"] = None
+            result["error"] = (
+                "No TMDb API token configured. Set the environment variable named by "
+                "config.yaml's tmdb.token_env_var (default TMDB_API_TOKEN)."
+            )
+        else:
+            provider = resolution_service.build_provider(config, connection)
+            result["cache_available"] = True
+            try:
+                provider.verify_credentials()
+            except TMDbAuthenticationError as exc:
+                result["authentication"] = "invalid"
+                result["network_ok"] = True
+                result["error"] = str(exc)
+            except TMDbRateLimitError as exc:
+                result["authentication"] = "unknown"
+                result["network_ok"] = False
+                result["error"] = str(exc)
+            except (TMDbTimeoutError, TMDbConnectionError, TMDbResponseError) as exc:
+                result["authentication"] = "unknown"
+                result["network_ok"] = False
+                result["error"] = str(exc)
+            else:
+                result["authentication"] = "valid"
+                result["network_ok"] = True
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=result)
+    else:
+        console.print(_render_provider_status_text(result))
+    return result
+
+
+def _render_cache_stats_text(stats: provider_cache_repository.CacheStats) -> str:
+    lines = ["MAMS Provider Cache Statistics", "=" * 30, ""]
+    lines.append(f"Total:   {stats.total_count}")
+    lines.append(f"Fresh:   {stats.fresh_count}")
+    lines.append(f"Expired: {stats.expired_count}")
+    return "\n".join(lines)
+
+
+def run_resolve_cache_stats(config: AppConfig, *, json_output: bool = False) -> provider_cache_repository.CacheStats:
+    """Show provider_cache statistics. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        stats = provider_cache_repository.get_cache_stats(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=stats.to_dict())
+    else:
+        console.print(_render_cache_stats_text(stats))
+    return stats
+
+
+def run_resolve_cache_clear(config: AppConfig, *, json_output: bool = False) -> int:
+    """Delete expired provider_cache rows only. Never touches external
+    identities, resolution attempts/assignments, or ingest plans -- those
+    tables have no foreign key to provider_cache at all (see
+    docs/DATABASE.md)."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        deleted = provider_cache_repository.clear_expired_entries(connection)
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data={"deleted": deleted})
+    else:
+        console.print(f"Deleted {deleted} expired cache entr{'y' if deleted == 1 else 'ies'}.")
+    return deleted
+
+
 def _render_ingest_plan_text(plan: ingest_repository.PlanRecord) -> str:
     lines = ["MAMS Dry-Run Ingest Plan", "=" * 24, "", f"Plan #{plan.id}"]
     lines.append(f"Status: {plan.status}")
@@ -1352,6 +1704,44 @@ def run_ingest_approve(config: AppConfig, plan_id: int, *, json_output: bool = F
     return plan
 
 
+def _render_readiness_text(plan_id: int, result: readiness.ReadinessResult) -> str:
+    lines = ["MAMS Execution-Readiness Audit", "=" * 30, "", f"Plan #{plan_id}", f"Status: {result.readiness_status.value}"]
+    lines.append("")
+    lines.append("Checks")
+    for check in result.checks:
+        marker = "PASS" if check.passed else "FAIL"
+        lines.append(f"  {marker:<4}  {check.code}")
+    lines.append("")
+    lines.append("EXECUTION WAS NOT PERFORMED.")
+    return "\n".join(lines)
+
+
+def run_ingest_audit(
+    config: AppConfig, plan_id: int, *, json_output: bool = False
+) -> readiness.ReadinessResult | None:
+    """Read-only execution-readiness audit for an approved dry-run ingest
+    plan (Milestone 7C). Never executes anything -- see
+    ingest_service.audit_plan/readiness.evaluate_readiness. Returns None
+    (after printing a clear error, mutating nothing) for an unknown
+    plan_id."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        try:
+            result = ingest_service.audit_plan(connection, config, plan_id=plan_id)
+        except ingest_service.IngestPlanError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=result.to_dict())
+    else:
+        console.print(_render_readiness_text(plan_id, result))
+    return result
+
+
 def run_mediainfo(path: str, *, json_output: bool) -> mediainfo.MediaInfoOutcome:
     """Diagnostic command: parse and display MediaInfo for a single file.
 
@@ -1453,6 +1843,24 @@ def main() -> None:
             run_identify_stats(config, json_output=args.json)
         elif args.identify_command == "show":
             run_identify_show(config, args.candidate_id, json_output=args.json)
+        elif args.identify_command == "override":
+            run_identify_override(
+                config,
+                args.media_file_id,
+                candidate_type=args.candidate_type,
+                title=args.title,
+                year=args.year,
+                series_title=args.series_title,
+                season_number=args.season_number,
+                episode_number=args.episode_number,
+                episode_title=args.episode_title,
+                reason=args.reason,
+                json_output=args.json,
+            )
+        elif args.identify_command == "clear-override":
+            run_identify_clear_override(config, args.media_file_id, json_output=args.json)
+        elif args.identify_command == "show-effective":
+            run_identify_show_effective(config, args.media_file_id, json_output=args.json)
     elif args.command == "resolve":
         if args.resolve_command == "evaluate":
             run_resolve_evaluate(
@@ -1481,6 +1889,12 @@ def main() -> None:
             run_resolve_reject(config, args.attempt_id, json_output=args.json)
         elif args.resolve_command == "stats":
             run_resolve_stats(config, json_output=args.json)
+        elif args.resolve_command == "provider-status":
+            run_resolve_provider_status(config, json_output=args.json)
+        elif args.resolve_command == "cache-stats":
+            run_resolve_cache_stats(config, json_output=args.json)
+        elif args.resolve_command == "cache-clear":
+            run_resolve_cache_clear(config, json_output=args.json)
     elif args.command == "ingest":
         if args.ingest_command == "plan":
             run_ingest_plan(
@@ -1494,6 +1908,8 @@ def main() -> None:
             run_ingest_stats(config, json_output=args.json)
         elif args.ingest_command == "approve":
             run_ingest_approve(config, args.plan_id, json_output=args.json)
+        elif args.ingest_command == "audit":
+            run_ingest_audit(config, args.plan_id, json_output=args.json)
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 

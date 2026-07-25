@@ -20,8 +20,11 @@ from mams.cli import (
     build_parser,
     run_identify_evaluate,
     run_inventory_scan,
+    run_resolve_cache_clear,
+    run_resolve_cache_stats,
     run_resolve_evaluate,
     run_resolve_list,
+    run_resolve_provider_status,
     run_resolve_reject,
     run_resolve_select,
     run_resolve_show,
@@ -32,7 +35,12 @@ from mams.db import connect, migrate
 from mams.identification_repository import list_candidates
 from mams.resolution_repository import CandidateMatchInput, record_attempt
 from mams.scoring import MatchScore
-from mams.tmdb import MovieResult
+from mams.tmdb import (
+    MovieResult,
+    TMDbAuthenticationError,
+    TMDbConnectionError,
+    TMDbRateLimitError,
+)
 
 
 def _write_config(tmp_path: Path, *, categories: dict[str, str], tmdb_token_env_var: str | None = "TMDB_API_TOKEN") -> Path:
@@ -331,3 +339,136 @@ def test_run_resolve_stats_empty_state(tmp_path: Path, capsys: pytest.CaptureFix
     stats = run_resolve_stats(config)
     assert stats.total_count == 0
     assert "Total: 0" in capsys.readouterr().out
+
+
+# --- provider-status ------------------------------------------------------------
+
+
+def test_parser_accepts_provider_status_and_cache_flags() -> None:
+    assert build_parser().parse_args(["resolve", "provider-status", "--json"]).json is True
+    assert build_parser().parse_args(["resolve", "cache-stats"]).json is False
+    args = build_parser().parse_args(["resolve", "cache-clear", "--expired-only"])
+    assert args.expired_only is True
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["resolve", "cache-clear"])  # --expired-only is required
+
+
+def test_provider_status_no_token_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("TMDB_API_TOKEN", raising=False)
+    config = load_config(_write_config(tmp_path, categories={"movies": str(tmp_path / "Movies")}))
+
+    result = run_resolve_provider_status(config)
+
+    assert result["configured"] is False
+    assert result["authentication"] is None
+    out = capsys.readouterr().out
+    assert "Configured: no" in out
+    assert "No TMDb API token configured" in out
+
+
+class _FakeStatusProvider:
+    def __init__(self, effect: BaseException | None) -> None:
+        self._effect = effect
+
+    def verify_credentials(self) -> None:
+        if self._effect is not None:
+            raise self._effect
+
+
+@pytest.mark.parametrize(
+    "effect, expected_auth, expected_network",
+    [
+        (None, "valid", "successful"),
+        (TMDbAuthenticationError("TMDb rejected the configured API token"), "invalid", "successful"),
+        (TMDbRateLimitError("TMDb rate limit exceeded"), "unknown", "failed"),
+        (TMDbConnectionError("TMDb request failed"), "unknown", "failed"),
+    ],
+)
+def test_provider_status_distinguishes_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    effect: BaseException | None,
+    expected_auth: str,
+    expected_network: str,
+) -> None:
+    monkeypatch.setenv("TMDB_API_TOKEN", "test-token")
+    config = load_config(_write_config(tmp_path, categories={"movies": str(tmp_path / "Movies")}))
+    monkeypatch.setattr(resolution_service, "build_provider", lambda cfg, conn: _FakeStatusProvider(effect))
+
+    result = run_resolve_provider_status(config)
+
+    assert result["configured"] is True
+    assert result["cache_available"] is True
+    assert result["authentication"] == expected_auth
+    assert result["network_ok"] == (expected_network == "successful")
+    out = capsys.readouterr().out
+    assert f"Authentication: {expected_auth}" in out
+    assert f"Network request: {expected_network}" in out
+
+
+def test_provider_status_never_prints_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token = "SUPER-SECRET-SHOULD-NOT-APPEAR"
+    monkeypatch.setenv("TMDB_API_TOKEN", token)
+    config = load_config(_write_config(tmp_path, categories={"movies": str(tmp_path / "Movies")}))
+    monkeypatch.setattr(resolution_service, "build_provider", lambda cfg, conn: _FakeStatusProvider(None))
+
+    result = run_resolve_provider_status(config, json_output=True)
+
+    assert token not in capsys.readouterr().out
+    assert token not in str(result)
+
+
+def test_provider_status_json_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TMDB_API_TOKEN", "test-token")
+    config = load_config(_write_config(tmp_path, categories={"movies": str(tmp_path / "Movies")}))
+    monkeypatch.setattr(resolution_service, "build_provider", lambda cfg, conn: _FakeStatusProvider(None))
+
+    run_resolve_provider_status(config, json_output=True)
+
+    out = capsys.readouterr().out
+    assert '"authentication": "valid"' in out
+    assert '"provider": "TMDb"' in out
+
+
+# --- cache-stats / cache-clear --------------------------------------------------
+
+
+def test_cache_stats_and_clear(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = load_config(_write_config(tmp_path, categories={"movies": str(tmp_path / "Movies")}))
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        from mams.provider_cache_repository import put_entry
+
+        put_entry(
+            connection, provider="TMDB", request_key="k1", endpoint="/search/movie",
+            response_json="{}", status_code=200, ttl_seconds=-10,  # already expired
+        )
+        put_entry(
+            connection, provider="TMDB", request_key="k2", endpoint="/search/movie",
+            response_json="{}", status_code=200, ttl_seconds=3600,
+        )
+    finally:
+        connection.close()
+    capsys.readouterr()
+
+    stats = run_resolve_cache_stats(config)
+    assert stats.total_count == 2
+    assert stats.expired_count == 1
+    assert stats.fresh_count == 1
+    assert "Expired: 1" in capsys.readouterr().out
+
+    deleted = run_resolve_cache_clear(config)
+    assert deleted == 1
+    assert "Deleted 1 expired cache entry." in capsys.readouterr().out
+
+    stats_after = run_resolve_cache_stats(config)
+    assert stats_after.total_count == 1
+    assert stats_after.expired_count == 0

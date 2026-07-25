@@ -14,9 +14,12 @@ import yaml
 
 from mams.cli import (
     build_parser,
+    run_identify_clear_override,
     run_identify_evaluate,
     run_identify_list,
+    run_identify_override,
     run_identify_show,
+    run_identify_show_effective,
     run_identify_stats,
     run_inventory_scan,
 )
@@ -311,3 +314,110 @@ def test_run_identify_show_unknown_id_is_a_clear_non_destructive_error(
 
     assert record is None
     assert "not found" in capsys.readouterr().out
+
+
+# --- override / clear-override / show-effective ------------------------------
+
+
+def _scan_and_evaluate(tmp_path: Path, name: str = "Alien.mkv") -> tuple[object, int]:
+    movies_root = _seed_movie(tmp_path, name=name)
+    config = load_config(_write_config(tmp_path, {"movies": str(movies_root)}))
+    run_inventory_scan(config, json_output=False, output=_report_path(tmp_path))
+    run_identify_evaluate(config)
+    records = run_identify_list(config)
+    return config, records[0].media_file_id
+
+
+def test_parser_accepts_override_flags() -> None:
+    args = build_parser().parse_args(
+        ["identify", "override", "1", "--type", "movie", "--title", "Alien", "--year", "1979", "--reason", "no year in filename"]
+    )
+    assert args.candidate_type == "MOVIE"
+    assert args.title == "Alien"
+    assert args.year == 1979
+    assert args.reason == "no year in filename"
+
+    episode_args = build_parser().parse_args(
+        ["identify", "override", "1", "--type", "episode", "--series", "Carnivale", "--season", "1", "--episode", "2"]
+    )
+    assert episode_args.candidate_type == "EPISODE"
+    assert episode_args.series_title == "Carnivale"
+    assert episode_args.season_number == 1
+    assert episode_args.episode_number == 2
+
+    assert build_parser().parse_args(["identify", "clear-override", "1", "--json"]).json is True
+    assert build_parser().parse_args(["identify", "show-effective", "1"]).media_file_id == 1
+
+
+def test_override_movie_without_year_reaches_resolvable_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _scan_and_evaluate(tmp_path)
+    capsys.readouterr()
+
+    override = run_identify_override(config, media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+
+    assert override is not None
+    assert override.title == "Alien"
+    assert override.year == 1979
+    out = capsys.readouterr().out
+    assert "Override created" in out
+
+
+def test_override_unknown_media_file_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = load_config(_write_config(tmp_path, {"movies": str(tmp_path / "Movies")}))
+    result = run_identify_override(config, 9999, candidate_type="MOVIE", title="Alien")
+    assert result is None
+    assert "No media file with id 9999" in capsys.readouterr().out
+
+
+def test_override_movie_missing_title_is_a_clear_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _scan_and_evaluate(tmp_path)
+    capsys.readouterr()
+
+    result = run_identify_override(config, media_file_id, candidate_type="MOVIE")
+
+    assert result is None
+    assert "requires a non-empty title" in capsys.readouterr().out
+
+
+def test_show_effective_reflects_override_then_reverts_after_clear(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _scan_and_evaluate(tmp_path)
+    run_identify_override(config, media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+    capsys.readouterr()
+
+    effective = run_identify_show_effective(config, media_file_id)
+    assert effective is not None
+    assert effective.source == "MANUAL_OVERRIDE"
+    assert "MANUAL_OVERRIDE" in capsys.readouterr().out
+
+    run_identify_clear_override(config, media_file_id)
+    capsys.readouterr()
+
+    reverted = run_identify_show_effective(config, media_file_id)
+    assert reverted is not None
+    assert reverted.source == "PARSED"
+
+
+def test_clear_override_noop_when_none_active(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _scan_and_evaluate(tmp_path)
+    capsys.readouterr()
+
+    result = run_identify_clear_override(config, media_file_id)
+
+    assert result is None
+    assert "nothing to clear" in capsys.readouterr().out
+
+
+def test_show_effective_json_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _scan_and_evaluate(tmp_path)
+    run_identify_override(config, media_file_id, candidate_type="MOVIE", title="Alien", year=1979)
+    capsys.readouterr()
+
+    effective = run_identify_show_effective(config, media_file_id, json_output=True)
+
+    assert effective is not None
+    out = capsys.readouterr().out
+    assert '"source": "MANUAL_OVERRIDE"' in out
