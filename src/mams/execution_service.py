@@ -686,12 +686,16 @@ class _ExecutionRun:
         step = self._begin(8)
         try:
             fs.remove_source_file(plan.source_path)
-            self.injector.maybe_fail(FaultPoint.AFTER_SOURCE_REMOVE_BEFORE_INVENTORY_REFRESH)
         except Exception as exc:  # noqa: BLE001
             return self._fail(step_id=step.id, step_type="REMOVE_SOURCE", error=exc, recovery_status="DESTINATION_VERIFIED_SOURCE_NOT_REMOVED")
         with self.connection:
             execution_repository.record_source_removed(self.connection, execution.id)
         self._complete(step.id)
+
+        try:
+            self.injector.maybe_fail(FaultPoint.AFTER_SOURCE_REMOVE_BEFORE_INVENTORY_REFRESH)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(step_id=None, step_type="REFRESH_INVENTORY", error=exc, recovery_status="INVENTORY_REFRESH_INCOMPLETE")
 
         # 9. REFRESH_INVENTORY
         step = self._begin(9)

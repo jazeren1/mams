@@ -14,6 +14,7 @@ import pytest
 
 from mams.config import AppConfig
 from mams.db import connect, migrate
+from mams.execution import FaultPoint
 from mams.execution_service import (
     ActiveExecutionExistsError,
     PlanNotApprovedError,
@@ -332,3 +333,134 @@ def test_execute_plan_rejects_second_call_while_active(connection: sqlite3.Conne
 
     with pytest.raises((PlanNotApprovedError, ActiveExecutionExistsError)):
         execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+
+# --- fault injection: every mutation boundary ------------------------------------
+
+_FAULT_POINT_EXPECTATIONS: dict[FaultPoint, tuple[str, str, str]] = {
+    FaultPoint.BEFORE_DIRECTORY_CREATE: ("EXECUTION_FAILED", "FAILED", "NONE"),
+    FaultPoint.AFTER_DIRECTORY_CREATE: ("EXECUTION_FAILED", "FAILED", "NONE"),
+    FaultPoint.BEFORE_COPY_START: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.DURING_COPY: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.AFTER_COPY_COMPLETE: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.BEFORE_CHECKSUM_COMPUTE: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.AFTER_CHECKSUM_COMPUTE_BEFORE_RENAME: (
+        "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT",
+    ),
+    FaultPoint.BEFORE_FINAL_RENAME: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.AFTER_FINAL_RENAME: ("RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "PARTIAL_DESTINATION_SOURCE_INTACT"),
+    FaultPoint.BEFORE_DESTINATION_VERIFY: (
+        "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED",
+    ),
+    FaultPoint.AFTER_DESTINATION_VERIFY_BEFORE_SOURCE_REMOVE: (
+        "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED",
+    ),
+    FaultPoint.AFTER_SOURCE_REMOVE_BEFORE_INVENTORY_REFRESH: (
+        "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "INVENTORY_REFRESH_INCOMPLETE",
+    ),
+    FaultPoint.AFTER_INVENTORY_REFRESH_BEFORE_FINALIZE: (
+        "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "INVENTORY_REFRESH_INCOMPLETE",
+    ),
+}
+
+
+class _FailAtPoint:
+    def __init__(self, point: FaultPoint) -> None:
+        self._point = point
+
+    def maybe_fail(self, point: FaultPoint) -> None:
+        if point is self._point:
+            raise RuntimeError(f"injected failure at {point.value}")
+
+
+def test_fault_point_expectations_cover_every_fault_point() -> None:
+    assert set(_FAULT_POINT_EXPECTATIONS) == set(FaultPoint)
+
+
+@pytest.mark.parametrize("point", list(FaultPoint))
+def test_fault_injection_at_every_boundary_produces_the_documented_outcome(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: FaultPoint
+) -> None:
+    """Proves the failure-mapping table from docs/EXECUTION-SAFETY.md at
+    all 13 named mutation boundaries -- exercised on the cross-filesystem
+    path, the only one where every boundary is reachable."""
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name=f"Alien-{point.value}.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+    original_bytes = source_path.read_bytes()
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+
+    result = execute_plan(
+        connection,
+        config,
+        plan_id=plan_id,
+        metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(point),
+    )
+
+    expected_plan_status, expected_execution_status, expected_recovery_status = _FAULT_POINT_EXPECTATIONS[point]
+    assert result.status == expected_execution_status
+    assert result.recovery_status == expected_recovery_status
+
+    plan_after = get_plan(connection, plan_id)
+    assert plan_after is not None
+    assert plan_after.status == expected_plan_status
+    assert plan_after.status != "EXECUTED"
+
+    destination_path = Path(result.destination_path)
+    if expected_recovery_status in ("NONE", "PARTIAL_DESTINATION_SOURCE_INTACT"):
+        # finalize_same_device_move only ever unlinks the source as its
+        # unguarded last line, after every prior check passed -- so the
+        # source is guaranteed intact for every fault point up to and
+        # including a failure inside the rename/commit step itself.
+        assert source_path.exists()
+        assert source_path.read_bytes() == original_bytes
+    elif expected_recovery_status == "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED":
+        assert source_path.exists()
+        assert destination_path.exists()
+        assert destination_path.read_bytes() == original_bytes
+    elif expected_recovery_status == "INVENTORY_REFRESH_INCOMPLETE":
+        assert not source_path.exists()
+        assert destination_path.exists()
+        assert destination_path.read_bytes() == original_bytes
+
+
+def test_fault_injection_never_produces_a_partial_temp_file_that_silently_disappears(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy interrupted mid-stream must leave its partial temp file on
+    disk as recovery evidence -- never auto-deleted."""
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienPartial.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+
+    result = execute_plan(
+        connection,
+        config,
+        plan_id=plan_id,
+        metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(FaultPoint.DURING_COPY),
+    )
+
+    assert result.recovery_status == "PARTIAL_DESTINATION_SOURCE_INTACT"
+    destination_directory = Path(plan.destination_directory)  # type: ignore[arg-type]
+    temp_files = list(destination_directory.glob(".*.mams-partial-*"))
+    assert len(temp_files) == 1
+    assert temp_files[0].exists()
