@@ -15,12 +15,16 @@ import pytest
 from mams.config import AppConfig
 from mams.db import connect, migrate
 from mams.execution import FaultPoint
+from mams.execution_lock import acquire_lock, read_lock, release_lock
+from mams.execution_repository import get_execution
 from mams.execution_service import (
     ActiveExecutionExistsError,
+    ExecutionLockHeldError,
     PlanNotApprovedError,
     PlanNotExecutableError,
     PlanNotFoundError,
     execute_plan,
+    inspect_recovery,
 )
 from mams.ingest_repository import get_plan
 from mams.ingest_service import approve, generate_plan
@@ -464,3 +468,223 @@ def test_fault_injection_never_produces_a_partial_temp_file_that_silently_disapp
     temp_files = list(destination_directory.glob(".*.mams-partial-*"))
     assert len(temp_files) == 1
     assert temp_files[0].exists()
+
+
+# --- lock contention ---------------------------------------------------------------
+
+
+def test_execute_plan_rejects_when_lock_already_held(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienLocked.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+    original_bytes = source_path.read_bytes()
+
+    state_directory = config.execution_state_directory
+    assert state_directory is not None
+    acquire_lock(state_directory, plan_id, token="someone-elses-token")
+
+    with pytest.raises(ExecutionLockHeldError) as excinfo:
+        execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    assert excinfo.value.existing is not None
+    assert excinfo.value.existing.token == "someone-elses-token"
+
+    # Nothing was mutated: no DB writes, no filesystem writes.
+    plan_after = get_plan(connection, plan_id)
+    assert plan_after is not None
+    assert plan_after.status == "APPROVED"
+    assert source_path.exists()
+    assert source_path.read_bytes() == original_bytes
+    destination_directory = Path(plan.destination_directory)  # type: ignore[arg-type]
+    assert not destination_directory.exists()
+
+    release_lock(state_directory, plan_id, token="someone-elses-token")
+
+
+def test_execute_plan_releases_lock_after_success(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienUnlock.mkv")
+    execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    state_directory = config.execution_state_directory
+    assert state_directory is not None
+    assert read_lock(state_directory, plan_id) is None
+
+
+def test_execute_plan_releases_lock_after_preflight_failure(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienPreflightFail.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    # Remove the source file after approval so preflight's source_exists
+    # check fails -- the audit's DB-only check still passes since
+    # nothing rescanned, so this reaches preflight and is rejected there.
+    Path(plan.source_path).unlink()
+
+    with pytest.raises(Exception):  # noqa: B017 -- PreflightFailedError, imported lazily below
+        execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    state_directory = config.execution_state_directory
+    assert state_directory is not None
+    assert read_lock(state_directory, plan_id) is None
+    plan_after = get_plan(connection, plan_id)
+    assert plan_after is not None
+    assert plan_after.status == "APPROVED"
+
+
+# --- inspect_recovery ----------------------------------------------------------------
+
+
+def test_inspect_recovery_returns_none_for_unknown_execution(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert inspect_recovery(connection, config, execution_id=999_999) is None
+
+
+def test_inspect_recovery_reports_partial_destination_source_intact(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienRecoveryA.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+    result = execute_plan(
+        connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(FaultPoint.AFTER_COPY_COMPLETE),
+    )
+    assert result.recovery_status == "PARTIAL_DESTINATION_SOURCE_INTACT"
+
+    guidance = inspect_recovery(connection, config, execution_id=result.id)
+    assert guidance is not None
+    assert guidance.recovery_status == "PARTIAL_DESTINATION_SOURCE_INTACT"
+    assert guidance.source_exists is True
+    assert guidance.temp_file_exists is True
+    assert "temporary file" in guidance.recommendation
+
+
+def test_inspect_recovery_reports_destination_verified_source_not_removed(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienRecoveryB.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+    result = execute_plan(
+        connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(FaultPoint.BEFORE_DESTINATION_VERIFY),
+    )
+    assert result.recovery_status == "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED"
+
+    guidance = inspect_recovery(connection, config, execution_id=result.id)
+    assert guidance is not None
+    assert guidance.source_exists is True
+    assert guidance.destination_exists is True
+    assert "not removed" in guidance.recommendation.lower()
+
+
+def test_inspect_recovery_reports_inventory_refresh_incomplete(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienRecoveryC.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+    result = execute_plan(
+        connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(FaultPoint.AFTER_INVENTORY_REFRESH_BEFORE_FINALIZE),
+    )
+    assert result.recovery_status == "INVENTORY_REFRESH_INCOMPLETE"
+
+    guidance = inspect_recovery(connection, config, execution_id=result.id)
+    assert guidance is not None
+    assert guidance.source_exists is False
+    assert guidance.destination_exists is True
+    assert "inventory" in guidance.recommendation.lower()
+
+
+def test_inspect_recovery_never_mutates_database_or_filesystem(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienRecoveryD.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+    result = execute_plan(
+        connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider(),
+        fault_injector=_FailAtPoint(FaultPoint.BEFORE_CHECKSUM_COMPUTE),
+    )
+
+    before = get_execution(connection, result.id)
+    assert before is not None
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("inspect_recovery must never mutate the filesystem")
+
+    monkeypatch.setattr(Path, "unlink", _forbidden)
+    monkeypatch.setattr(Path, "mkdir", _forbidden)
+
+    guidance = inspect_recovery(connection, config, execution_id=result.id)
+    assert guidance is not None
+
+    after = get_execution(connection, result.id)
+    assert after == before
+
+
+def test_inspect_recovery_classifies_orphaned_executing_as_interrupted(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """An EXECUTING row with no matching (or no) lock file simulates a
+    crashed process -- inspect_recovery must not assume 'still running'
+    just because the DB status says EXECUTING."""
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="AlienOrphaned.mkv")
+    with connection:
+        connection.execute("UPDATE ingest_plans SET status = 'EXECUTING' WHERE id = ?", (plan_id,))
+        cursor = connection.execute(
+            """
+            INSERT INTO ingest_executions (
+                ingest_plan_id, plan_version, status, source_path, destination_path, source_size_bytes, lock_token
+            ) VALUES (?, 1, 'EXECUTING', '/x', '/y', 1, 'orphaned-token')
+            """,
+            (plan_id,),
+        )
+        execution_id = cursor.lastrowid
+    assert execution_id is not None
+
+    guidance = inspect_recovery(connection, config, execution_id=execution_id)
+    assert guidance is not None
+    assert guidance.recovery_status == "INTERRUPTED_STATE_UNKNOWN"
+    assert guidance.lock_held is False
