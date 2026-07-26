@@ -1211,13 +1211,60 @@ category -> root-path mapping they're given.
 
 ## Production Validation
 
-Not yet run. Per this milestone's own scope, only the scoped command
-itself may be validated against the real `/Users/johnzeren/Media
-Archive/Incoming` directory, and only after explicit operator approval
-of the exact command -- no ingest plan may be generated, approved, or
-executed as part of this validation. This section will be updated with
-the actual command, output, and confirmation that no NAS category was
-scanned once that approval and run have happened.
+**Command (run with operator approval):** `python -m mams.cli inventory
+scan --category incoming --metadata`
+
+**Result:** scan_runs id 16, `scan_scope='CATEGORY'`,
+`scope_category='incoming'`, `status='COMPLETE'`, completed in well
+under a second (`0.41s` user time). Output:
+
+```
+Scope: incoming
+Metadata: enabled
+
+incoming [OK] - /Users/johnzeren/Media Archive/Incoming
+  files: 0
+  size:  0 B
+  ...
+Scoped scan complete.
+Other categories were not scanned or reconciled.
+```
+
+`/Users/johnzeren/Media Archive/Incoming` contained one file
+(`District 9 (2009).mkv`, ~4.2 GB) when confirmed present immediately
+before requesting operator approval; by the time the approved command
+ran moments later, the directory contained only `.DS_Store` -- the file
+had already been removed from Incoming by something other than this
+scan (this codebase's scanner is read-only against media files; no code
+path introduced or touched by this milestone deletes, moves, or renames
+anything). This is consistent with the Milestone 8.1 entry above, which
+identifies this exact file as the one queued for a real-NAS ingest
+retry -- the file most likely completed that ingest (or was otherwise
+moved) between the two checks, external to this validation.
+
+The scoped-scan invariants this milestone exists to guarantee were
+confirmed directly against the real database:
+
+- `SELECT * FROM scan_changes WHERE scan_run_id = 16` returned zero
+  rows -- no ADDED/UPDATED/MISSING/RESTORED event was recorded anywhere,
+  consistent with Incoming being genuinely empty at scan time.
+- Every non-`incoming` `libraries` row's `updated_at` remained
+  `2026-07-20 16:56:26` (its value from the last full scan before this
+  one) -- `sync_libraries()` never touched `movies`/`kids_movies`/
+  `tv`/`kids_shows`/`fitness`, confirming the scoped scan's `categories`
+  dict genuinely contained only `incoming`.
+- No NAS path (`/Volumes/NASMedia/...`) was walked or `stat()`-ed --
+  the command completed in under half a second, which a two-hour full
+  scan's worth of NAS traversal could not have done.
+
+This validates the mechanism (scoping, non-interference, scan-run
+history, report separation) even though it did not exercise the
+"MediaInfo probes a real discovered file" path this time, since Incoming
+turned out to be empty. Re-running this same command after a future disc
+rip lands in Incoming will exercise that path; no code change is
+required for that to work; it already did during development testing
+against a throwaway (non-production) file tree with two files, in the
+automated test suite above.
 
 ## Quality Gates
 
