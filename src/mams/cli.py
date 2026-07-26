@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import json
 import sqlite3
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,25 @@ console = Console()
 
 DEFAULT_INVENTORY_REPORT = "reports/library.json"
 
+
+class _SingleCategoryAction(argparse.Action):
+    """Rejects a repeated `--category` at parse time (exit code 2, via
+    `parser.error`) rather than silently keeping the last occurrence --
+    Milestone 8.2 supports scanning exactly one category per invocation,
+    never a list."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} may be specified at most once.")
+        setattr(namespace, self.dest, values)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mams")
     parser.add_argument("--config", default="config/config.yaml")
@@ -50,12 +70,24 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--metadata",
         action="store_true",
-        help="Enrich each discovered file with MediaInfo technical metadata (slower; requires mediainfo).",
+        help="Probe media files with MediaInfo within the selected scan scope (slower; requires mediainfo).",
     )
     scan_parser.add_argument(
         "--no-db",
         action="store_true",
         help="Skip database persistence; only write the JSON/summary reports.",
+    )
+    scan_parser.add_argument(
+        "--category",
+        action=_SingleCategoryAction,
+        default=None,
+        help=(
+            "Scan and reconcile only one configured inventory category. Other categories "
+            "are not walked, probed, or reconciled. Valid values come from the configured "
+            "nas/incoming categories, not a hard-coded list (e.g. incoming, movies, tv). "
+            "May be given at most once; omit to run the existing full scan across every "
+            "configured category."
+        ),
     )
 
     list_parser = inventory_subs.add_parser("list", help="List media_files rows from the database. Read-only.")
@@ -362,14 +394,115 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+class InventoryScanScopeError(ValueError):
+    """Base for an invalid `mams inventory scan --category CATEGORY` request.
+
+    `main()` catches this specifically, prints the message, and exits
+    non-zero -- unlike most other `run_*` errors in this module, which
+    print and return `None`, this one must be a clear command failure
+    per the Milestone 8.2 CLI contract."""
+
+
+class UnknownCategoryError(InventoryScanScopeError):
+    """`--category CATEGORY` named a category absent from the currently
+    configured `nas.categories`/`ingest.incoming_roots`. Lists the valid
+    configured category names -- never a hard-coded CLI list."""
+
+
+def _scoped_report_payload(
+    report: inventory.InventoryReport,
+    *,
+    category: str,
+    metadata_enabled: bool,
+    scan_run: inventory_repository.ScanRunRecord | None,
+) -> dict[str, object]:
+    """Wrap a category-scoped `InventoryReport` with the scan-scope
+    metadata a scoped report must carry (scan run id, scope, selected
+    category, metadata flag, timing) -- keeps the existing
+    `InventoryReport.to_dict()` shape (`file_count`/`total_size_bytes`/
+    `categories`) nested inside, rather than inventing a second report
+    format. `scan_run` is `None` when `--no-db` was given or persistence
+    failed; the scan-run fields are simply `None` in that case."""
+    payload: dict[str, object] = {
+        "scan_scope": "CATEGORY",
+        "scope_category": category,
+        "metadata_enabled": metadata_enabled,
+        "scan_run_id": scan_run.id if scan_run is not None else None,
+        "started_at": scan_run.started_at if scan_run is not None else None,
+        "completed_at": scan_run.completed_at if scan_run is not None else None,
+    }
+    payload.update(report.to_dict())
+    return payload
+
+
+def _render_scoped_scan_text(
+    report: inventory.InventoryReport, *, category: str, metadata_enabled: bool
+) -> str:
+    """Human-readable summary for a category-scoped scan -- deliberately
+    distinct from `inventory.render_summary()` (used for full scans) so a
+    scoped scan can never be mistaken for a full-library report: it names
+    its scope up front and states plainly that other categories were left
+    untouched."""
+    lines = ["MAMS Inventory Scan", "=" * 19, "", f"Scope: {category}", f"Metadata: {'enabled' if metadata_enabled else 'disabled'}"]
+    cat = report.categories[0] if report.categories else None
+    if cat is not None:
+        lines.append("")
+        status = "OK" if cat.exists else "MISSING"
+        lines.append(f"{cat.category} [{status}] - {cat.root_path}")
+        if not cat.exists:
+            lines.append("  (directory not found; skipped)")
+        else:
+            lines.append(f"  files: {cat.file_count}")
+            lines.append(f"  size:  {_human_size(cat.total_size_bytes)}")
+            if metadata_enabled:
+                probed = [f for f in cat.files if f.media_info is not None or f.media_info_error is not None]
+                succeeded = sum(1 for f in probed if f.media_info is not None)
+                failed = sum(1 for f in probed if f.media_info_error is not None)
+                lines.append(f"  metadata extracted: {succeeded}")
+                # No incremental metadata cache exists yet (see mediainfo.py):
+                # every discovered file is re-probed, so nothing is ever
+                # "unchanged" -- reported explicitly as 0 rather than omitted,
+                # so this line never implies a snapshot was reused.
+                lines.append("  metadata unchanged: 0")
+                lines.append(f"  metadata errors:    {failed}")
+    lines.append("")
+    lines.append("Scoped scan complete.")
+    lines.append("Other categories were not scanned or reconciled.")
+    return "\n".join(lines)
+
+
 def run_inventory_scan(
-    config: AppConfig, *, json_output: bool, output: str, metadata: bool = False, use_db: bool = True
+    config: AppConfig,
+    *,
+    json_output: bool,
+    output: str = DEFAULT_INVENTORY_REPORT,
+    metadata: bool = False,
+    use_db: bool = True,
+    category: str | None = None,
 ) -> inventory.InventoryReport:
-    """Scan configured NAS categories and write JSON + summary reports.
+    """Scan configured NAS/incoming categories and write JSON + summary reports.
 
     Read-only against the NAS: this only reads directory entries and file
     sizes (and, with `metadata=True`, invokes the read-only `mediainfo`
     tool). It never renames, moves, or deletes scanned media.
+
+    `category=None` (the default) preserves the original full scan across
+    every configured category, writing `reports/library.json` /
+    `reports/library-summary.txt` exactly as before. `category="incoming"`
+    (etc.) restricts *both* discovery and reconciliation to that one
+    configured category: `categories` below becomes a single-entry dict,
+    and every downstream call (`inventory.scan_categories()`,
+    `inventory_repository.persist_scan()`,
+    `inventory_repository.read_inventory_report()`) already only touches
+    what's in that dict -- no separate scoped code path exists in any of
+    those three functions. Raises `UnknownCategoryError` for a category not
+    present in the configured `nas.categories`/`ingest.incoming_roots` --
+    caught by `main()`, printed, and turned into a non-zero exit, never a
+    stack trace. A category scan's `--output` defaults to
+    `reports/library-{category}.json` rather than the full scan's default,
+    so a bare `--category CATEGORY` (the common case) can never overwrite
+    the full-library report; an explicit `--output` is used exactly as
+    given, same as a full scan.
 
     Unless `use_db` is False, the scan result is persisted into the SQLite
     inventory schema via `inventory_repository.persist_scan()` (pending
@@ -389,10 +522,20 @@ def run_inventory_scan(
     # and docs/DATABASE.md ("Incoming as a category"). No change to
     # inventory.py itself: it has always operated on a plain category-name
     # -> root-path mapping.
-    categories = {**config.nas_categories, **config.incoming_categories}
+    configured_categories = {**config.nas_categories, **config.incoming_categories}
+
+    if category is not None and category not in configured_categories:
+        valid = ", ".join(sorted(configured_categories)) or "(none configured)"
+        raise UnknownCategoryError(f"Unknown category '{category}'. Valid categories: {valid}")
+
+    if category is not None and output == DEFAULT_INVENTORY_REPORT:
+        output = f"reports/library-{category}.json"
+
+    categories = {category: configured_categories[category]} if category is not None else configured_categories
     provider = mediainfo.MediaInfoProvider() if metadata else None
     report = inventory.scan_categories(categories, metadata_provider=provider)
     output_report = report
+    scan_run_record: inventory_repository.ScanRunRecord | None = None
 
     if use_db:
         migrate(config.database_path)
@@ -405,9 +548,12 @@ def run_inventory_scan(
                 categories,
                 metadata_enabled=metadata,
                 mediainfo_version=mediainfo_version,
+                scan_scope="CATEGORY" if category is not None else "FULL",
+                scope_category=category,
             )
             console.print(f"[dim]Database scan run:[/dim] {scan_run_id} (COMPLETE)")
             output_report = inventory_repository.read_inventory_report(connection, categories)
+            scan_run_record = inventory_repository.get_scan_run(connection, scan_run_id)
         except Exception as exc:  # noqa: BLE001 - reported, not fatal to report generation
             console.print(f"[yellow]Database persistence failed:[/yellow] {exc}")
         finally:
@@ -415,16 +561,31 @@ def run_inventory_scan(
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(output_report.to_json(), encoding="utf-8")
-
-    summary_path = output_path.with_name(f"{output_path.stem}-summary.txt")
-    summary_text = inventory.render_summary(output_report)
-    summary_path.write_text(summary_text, encoding="utf-8")
-
-    if json_output:
-        console.print_json(output_report.to_json())
+    if category is not None and output_path.name == f"library-{category}.json":
+        summary_path = output_path.with_name(f"library-summary-{category}.txt")
     else:
-        console.print(summary_text)
+        summary_path = output_path.with_name(f"{output_path.stem}-summary.txt")
+
+    if category is not None:
+        payload = _scoped_report_payload(
+            output_report, category=category, metadata_enabled=metadata, scan_run=scan_run_record
+        )
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        summary_text = _render_scoped_scan_text(output_report, category=category, metadata_enabled=metadata)
+        summary_path.write_text(summary_text, encoding="utf-8")
+        if json_output:
+            console.print_json(data=payload)
+        else:
+            console.print(summary_text)
+    else:
+        output_path.write_text(output_report.to_json(), encoding="utf-8")
+        summary_text = inventory.render_summary(output_report)
+        summary_path.write_text(summary_text, encoding="utf-8")
+        if json_output:
+            console.print_json(output_report.to_json())
+        else:
+            console.print(summary_text)
+
     console.print(f"\n[dim]JSON report:    {output_path}[/dim]")
     console.print(f"[dim]Summary report: {summary_path}[/dim]")
     return report
@@ -2061,13 +2222,18 @@ def main() -> None:
         console.print(f"Dry run: {config.dry_run}")
     elif args.command == "inventory":
         if args.inventory_command == "scan":
-            run_inventory_scan(
-                config,
-                json_output=args.json,
-                output=args.output,
-                metadata=args.metadata,
-                use_db=not args.no_db,
-            )
+            try:
+                run_inventory_scan(
+                    config,
+                    json_output=args.json,
+                    output=args.output,
+                    metadata=args.metadata,
+                    use_db=not args.no_db,
+                    category=args.category,
+                )
+            except InventoryScanScopeError as exc:
+                console.print(f"[red]{exc}[/red]")
+                raise SystemExit(1) from None
         elif args.inventory_command == "list":
             run_inventory_list(
                 config,
