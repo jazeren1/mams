@@ -792,6 +792,7 @@ class RecoveryGuidance:
     source_exists: bool
     destination_exists: bool
     temp_file_exists: bool
+    temp_file_paths: tuple[str, ...]
     lock_held: bool
     lock_matches_execution: bool
     recommendation: str
@@ -805,6 +806,7 @@ class RecoveryGuidance:
             "source_exists": self.source_exists,
             "destination_exists": self.destination_exists,
             "temp_file_exists": self.temp_file_exists,
+            "temp_file_paths": list(self.temp_file_paths),
             "lock_held": self.lock_held,
             "lock_matches_execution": self.lock_matches_execution,
             "recommendation": self.recommendation,
@@ -856,12 +858,17 @@ def inspect_recovery(
     source_exists = fs.path_exists(execution.source_path)
     destination_exists = fs.path_exists(execution.destination_path)
     destination_directory = str(Path(execution.destination_path).parent)
-    temp_file_exists = False
+    temp_file_paths: tuple[str, ...] = ()
     if fs.path_exists(destination_directory) and fs.is_directory(destination_directory):
-        temp_file_exists = any(
-            name.startswith(f".{Path(execution.destination_path).name}.mams-partial-")
-            for name in _list_directory_names(destination_directory)
+        temp_prefix = f".{Path(execution.destination_path).name}.mams-partial-"
+        temp_file_paths = tuple(
+            sorted(
+                str(Path(destination_directory) / name)
+                for name in _list_directory_names(destination_directory)
+                if name.startswith(temp_prefix)
+            )
         )
+    temp_file_exists = bool(temp_file_paths)
 
     lock_held = False
     lock_matches_execution = False
@@ -876,6 +883,8 @@ def inspect_recovery(
         recovery_status = "INTERRUPTED_STATE_UNKNOWN"
 
     recommendation = _RECOMMENDATIONS.get(recovery_status or "NONE", _RECOMMENDATIONS["OTHER_REQUIRES_MANUAL_INSPECTION"])
+    if temp_file_paths:
+        recommendation = f"{recommendation} Discovered temporary file(s): {', '.join(temp_file_paths)}"
 
     return RecoveryGuidance(
         execution_id=execution.id,
@@ -885,6 +894,7 @@ def inspect_recovery(
         source_exists=source_exists,
         destination_exists=destination_exists,
         temp_file_exists=temp_file_exists,
+        temp_file_paths=temp_file_paths,
         lock_held=lock_held,
         lock_matches_execution=lock_matches_execution,
         recommendation=recommendation,

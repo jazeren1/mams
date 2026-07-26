@@ -639,6 +639,17 @@ def test_inspect_recovery_reports_partial_destination_source_intact(
     assert guidance.temp_file_exists is True
     assert "temporary file" in guidance.recommendation
 
+    # Recovery output must report the exact discovered temp path, not
+    # just a boolean -- matches the real production naming pattern
+    # `.<final-filename>.mams-partial-<token>` exactly.
+    destination_path = Path(result.destination_path)
+    assert len(guidance.temp_file_paths) == 1
+    discovered_temp = Path(guidance.temp_file_paths[0])
+    assert discovered_temp.parent == destination_path.parent
+    assert discovered_temp.name.startswith(f".{destination_path.name}.mams-partial-")
+    assert discovered_temp.exists()
+    assert guidance.temp_file_paths[0] in guidance.recommendation
+
 
 def test_inspect_recovery_reports_destination_verified_source_not_removed(
     connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

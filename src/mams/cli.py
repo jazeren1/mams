@@ -1991,6 +1991,7 @@ def _render_recovery_text(guidance: execution_service.RecoveryGuidance) -> str:
         f"Source exists:               {guidance.source_exists}",
         f"Destination exists:          {guidance.destination_exists}",
         f"Temp file exists:            {guidance.temp_file_exists}",
+        f"Temp file path(s):           {', '.join(guidance.temp_file_paths) if guidance.temp_file_paths else '(none found)'}",
         f"Lock held:                   {guidance.lock_held}",
         f"Lock matches this execution: {guidance.lock_matches_execution}",
         "",
