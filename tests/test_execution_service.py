@@ -1,0 +1,276 @@
+"""Tests for execution_service.py: the Milestone 8 approved-plan
+executor. Builds a genuinely READY_FOR_EXECUTOR plan the same way
+test_ingest_service.py's audit tests do (seed media file -> candidate
+-> resolve identity -> generate_plan -> approve), then exercises
+execute_plan() against real files under tmp_path.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from mams.config import AppConfig
+from mams.db import connect, migrate
+from mams.execution_service import (
+    ActiveExecutionExistsError,
+    PlanNotApprovedError,
+    PlanNotExecutableError,
+    PlanNotFoundError,
+    execute_plan,
+)
+from mams.ingest_repository import get_plan
+from mams.ingest_service import approve, generate_plan
+from mams.mediainfo import AudioTrack, MediaInfo, MediaInfoOutcome, VideoTrack
+from mams.resolution_repository import assign_identity, upsert_external_identity
+
+REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "database" / "migrations"
+
+
+@pytest.fixture()
+def connection(tmp_path: Path) -> sqlite3.Connection:
+    db_path = tmp_path / "mams.db"
+    migrate(db_path, REPO_MIGRATIONS_DIR)
+    conn = connect(db_path)
+    yield conn
+    conn.close()
+
+
+def _config(tmp_path: Path, **execution_overrides: object) -> AppConfig:
+    execution: dict[str, object] = {"state_directory": str(tmp_path / ".mams" / "locks")}
+    execution.update(execution_overrides)
+    return AppConfig(
+        raw={
+            "ingest": {
+                "incoming_roots": [str(tmp_path / "Incoming")],
+                "movie_destination_category": "movies",
+                "tv_destination_category": "tv",
+                "kids_movie_destination_category": "kids_movies",
+                "kids_tv_destination_category": "kids_shows",
+            },
+            "nas": {
+                "categories": {
+                    "movies": str(tmp_path / "NAS" / "Movies"),
+                    "kids_movies": str(tmp_path / "NAS" / "KidsMovies"),
+                    "tv": str(tmp_path / "NAS" / "TV"),
+                    "kids_shows": str(tmp_path / "NAS" / "KidsShows"),
+                }
+            },
+            "execution": execution,
+        }
+    )
+
+
+def _lastrowid(cursor: sqlite3.Cursor) -> int:
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
+
+
+def _seed_media_file(
+    connection: sqlite3.Connection,
+    tmp_path: Path,
+    *,
+    name: str = "Alien.mkv",
+    size_bytes: int = 4096,
+) -> int:
+    row = connection.execute("SELECT id FROM libraries WHERE category = 'incoming'").fetchone()
+    if row is not None:
+        library_id = row["id"]
+    else:
+        library_id = _lastrowid(
+            connection.execute(
+                "INSERT INTO libraries (category, root_path) VALUES ('incoming', ?)", (str(tmp_path / "Incoming"),)
+            )
+        )
+    scan_id = _lastrowid(connection.execute("INSERT INTO scan_runs DEFAULT VALUES"))
+    incoming_file = tmp_path / "Incoming" / name
+    incoming_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"\x01\x02\x03\x04" * (size_bytes // 4)
+    incoming_file.write_bytes(payload)
+    absolute_path = str(incoming_file)
+    real_mtime = incoming_file.stat().st_mtime
+    media_file_id = _lastrowid(
+        connection.execute(
+            """
+            INSERT INTO media_files (
+                library_id, absolute_path, relative_path, filename, extension, parent_directory, layout,
+                size_bytes, state, duration_seconds, media_info_error, media_info_probed_at, container,
+                first_seen_scan_id, last_seen_scan_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, 'ACTIVE', ?, NULL, '2024-01-01T00:00:00', 'Matroska', ?, ?)
+            """,
+            (
+                library_id, absolute_path, name, name, ".mkv", str(tmp_path / "Incoming"),
+                len(payload), 7020.0, scan_id, scan_id,
+            ),
+        )
+    )
+    connection.execute(
+        "UPDATE media_files SET mtime = ? WHERE id = ?", (real_mtime, media_file_id)
+    )
+    connection.execute("INSERT INTO video_tracks (media_file_id, track_index) VALUES (?, 0)", (media_file_id,))
+    connection.execute("INSERT INTO audio_tracks (media_file_id, track_index) VALUES (?, 0)", (media_file_id,))
+    return media_file_id
+
+
+def _seed_candidate(connection: sqlite3.Connection, *, media_file_id: int) -> int:
+    return _lastrowid(
+        connection.execute(
+            "INSERT INTO identification_candidates (media_file_id, candidate_type, parsed_title, confidence, parser_version) "
+            "VALUES (?, 'MOVIE', 'Alien', 'HIGH', 1)",
+            (media_file_id,),
+        )
+    )
+
+
+def _resolve_movie_identity(connection: sqlite3.Connection, *, media_file_id: int, candidate_id: int) -> int:
+    identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=348, title="Alien", release_year=1979)
+    assignment = assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=identity.id, resolution_attempt_id=None, assignment_method="AUTO", confidence="HIGH",
+    )
+    return assignment.id
+
+
+def _ensure_nas_roots_exist(tmp_path: Path) -> None:
+    """A real NAS mount would already exist as a directory before any
+    execution is attempted -- generate_plan()/approve() never require
+    this (dry-run only), but execute_plan()'s preflight does (it must
+    stat the destination root to resolve a device id and free space)."""
+    for category in ("Movies", "KidsMovies", "TV", "KidsShows"):
+        (tmp_path / "NAS" / category).mkdir(parents=True, exist_ok=True)
+
+
+def _build_ready_approved_plan(connection: sqlite3.Connection, tmp_path: Path, config: AppConfig, *, name: str = "Alien.mkv") -> int:
+    _ensure_nas_roots_exist(tmp_path)
+    media_file_id = _seed_media_file(connection, tmp_path, name=name)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "READY_FOR_REVIEW"
+    approved = approve(connection, plan.id)
+    assert approved.status == "APPROVED"
+    return approved.id
+
+
+class _FakeMetadataProvider:
+    """Always reports a plausible probe result -- avoids depending on
+    the real `mediainfo` executable being installed for these tests."""
+
+    def probe(self, path: Path) -> MediaInfoOutcome:
+        return MediaInfoOutcome(
+            media_info=MediaInfo(
+                container="Matroska",
+                duration_seconds=7020.0,
+                overall_bitrate=5_000_000,
+                video_tracks=(
+                    VideoTrack(
+                        codec="HEVC", width=1920, height=1080, aspect_ratio="16:9",
+                        frame_rate=23.976, hdr_format=None, bit_depth=8, scan_type="Progressive",
+                    ),
+                ),
+                audio_tracks=(AudioTrack(codec="AC3", language="eng", channels=6, bitrate=640_000, default=True),),
+                subtitle_tracks=(),
+            ),
+            error=None,
+        )
+
+
+def test_execute_plan_same_filesystem_happy_path(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config)
+    source_path = tmp_path / "Incoming" / "Alien.mkv"
+    original_bytes = source_path.read_bytes()
+
+    result = execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    assert result.status == "SUCCEEDED"
+    assert result.transfer_strategy == "SAME_FILESYSTEM_ATOMIC_RENAME"
+    assert result.recovery_status == "NONE"
+
+    destination_path = Path(result.destination_path)
+    assert destination_path.exists()
+    assert destination_path.read_bytes() == original_bytes
+    assert not source_path.exists()
+
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    assert plan.status == "EXECUTED"
+    assert plan.executed_at is not None
+
+    media_file = connection.execute(
+        "SELECT * FROM media_files WHERE absolute_path = ?", (str(destination_path),)
+    ).fetchone()
+    assert media_file is not None
+    assert media_file["state"] == "ACTIVE"
+
+    change = connection.execute(
+        "SELECT * FROM scan_changes WHERE media_file_id = ? ORDER BY id DESC LIMIT 1", (media_file["id"],)
+    ).fetchone()
+    assert change["change_type"] == "UPDATED"
+    assert change["previous_absolute_path"] == str(source_path)
+
+    assert result.steps[0].step_type == "VALIDATE_SOURCE"
+    assert result.steps[-1].step_type == "FINALIZE"
+    assert all(step.status == "SUCCEEDED" or step.status == "SKIPPED" for step in result.steps)
+    plex_step = next(step for step in result.steps if step.step_type == "PLEX_REFRESH")
+    assert plex_step.status == "SKIPPED"
+    assert result.plex_refresh_status == "SKIPPED"
+
+
+def test_execute_plan_rejects_unknown_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with pytest.raises(PlanNotFoundError):
+        execute_plan(connection, config, plan_id=999_999)
+
+
+def test_execute_plan_rejects_non_approved_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "READY_FOR_REVIEW"
+
+    with pytest.raises(PlanNotApprovedError):
+        execute_plan(connection, config, plan_id=plan.id)
+
+
+def test_execute_plan_rejects_stale_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    """Simulates a rescan that recorded a changed size in canonical
+    inventory without the plan being regenerated -- exactly what
+    readiness.py's source_size_matches_plan_snapshot check exists to
+    catch, independent of and before any live filesystem preflight."""
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config)
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    connection.execute("UPDATE media_files SET size_bytes = size_bytes + 1 WHERE id = ?", (plan.media_file_id,))
+
+    with pytest.raises(PlanNotExecutableError):
+        execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    assert plan.status == "APPROVED"
+
+
+def test_execute_plan_rejects_second_call_while_active(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    """A currently-EXECUTING execution (simulated by directly inserting
+    one) must block a second execute_plan() call for the same plan."""
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config)
+    with connection:
+        connection.execute("UPDATE ingest_plans SET status = 'EXECUTING' WHERE id = ?", (plan_id,))
+        connection.execute(
+            """
+            INSERT INTO ingest_executions (
+                ingest_plan_id, plan_version, status, source_path, destination_path, source_size_bytes, lock_token
+            ) VALUES (?, 1, 'EXECUTING', '/x', '/y', 1, 'tok')
+            """,
+            (plan_id,),
+        )
+
+    with pytest.raises((PlanNotApprovedError, ActiveExecutionExistsError)):
+        execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())

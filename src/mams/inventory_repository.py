@@ -121,11 +121,19 @@ def sync_libraries(connection: sqlite3.Connection, categories: dict[str, str]) -
 
 
 def start_scan_run(
-    connection: sqlite3.Connection, *, metadata_enabled: bool, mediainfo_version: str | None
+    connection: sqlite3.Connection,
+    *,
+    metadata_enabled: bool,
+    mediainfo_version: str | None,
+    triggered_by: str = "SCAN",
 ) -> int:
+    """`triggered_by='EXECUTION'` tags a scan_runs row created by the
+    Milestone 8 executor's targeted single-file inventory refresh
+    (`relocate_media_file`), distinguishing it from a real directory-walk
+    scan in scan history -- see `0014_ingest_executions.sql`."""
     cursor = connection.execute(
-        "INSERT INTO scan_runs (metadata_enabled, mediainfo_version) VALUES (?, ?)",
-        (int(metadata_enabled), mediainfo_version),
+        "INSERT INTO scan_runs (metadata_enabled, mediainfo_version, triggered_by) VALUES (?, ?, ?)",
+        (int(metadata_enabled), mediainfo_version, triggered_by),
     )
     return _lastrowid(cursor)
 

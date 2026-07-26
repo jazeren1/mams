@@ -57,6 +57,23 @@ class AppConfig:
             "kids_movie": ingest.get("kids_movie_destination_category", "kids_movies"),
             "kids_tv": ingest.get("kids_tv_destination_category", "kids_shows"),
         }
+    @property
+    def checksum_algorithm(self) -> str:
+        return str(self.raw.get("execution", {}).get("checksum_algorithm", "sha256"))
+    @property
+    def copy_buffer_bytes(self) -> int:
+        return int(self.raw.get("execution", {}).get("copy_buffer_bytes", 8 * 1024 * 1024))
+    @property
+    def execution_state_directory(self) -> Path | None:
+        """Local scratch directory for Milestone 8's execution lock
+        files -- `None` if unconfigured, which is itself a preflight
+        failure (see execution.py); no implicit fallback path is chosen
+        for something this safety-critical."""
+        value = self.raw.get("execution", {}).get("state_directory")
+        return Path(value).expanduser() if value else None
+    @property
+    def enable_plex_refresh(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("enable_plex_refresh", False))
 
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)

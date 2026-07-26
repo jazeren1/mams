@@ -291,6 +291,13 @@ def mark_execution_recovery_required(
     return execution
 
 
+def record_source_checksum(connection: sqlite3.Connection, execution_id: int, checksum: str) -> None:
+    connection.execute(
+        "UPDATE ingest_executions SET source_checksum = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (checksum, execution_id),
+    )
+
+
 def record_source_removed(connection: sqlite3.Connection, execution_id: int) -> None:
     connection.execute(
         "UPDATE ingest_executions SET source_removed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
