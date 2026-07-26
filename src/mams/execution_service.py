@@ -236,6 +236,62 @@ def _checksum_algorithm_supported(algorithm: str) -> bool:
     return algorithm in hashlib.algorithms_available
 
 
+@dataclass(frozen=True)
+class ExecutionPreview:
+    """Read-only preview for the CLI's pre-confirmation prompt. Never
+    acquires the lock and never mutates anything -- the `transfer_strategy`
+    shown here is a best-effort guess from currently observable device
+    IDs; `execute_plan()` always redecides it fresh under the lock, and
+    that later decision is the only one that matters."""
+
+    plan_id: int
+    plan_status: str
+    source_path: str
+    destination_path: str | None
+    transfer_strategy: str | None
+    readiness_status: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "plan_id": self.plan_id,
+            "plan_status": self.plan_status,
+            "source_path": self.source_path,
+            "destination_path": self.destination_path,
+            "transfer_strategy": self.transfer_strategy,
+            "readiness_status": self.readiness_status,
+        }
+
+
+def preview_execution(connection: sqlite3.Connection, config: AppConfig, *, plan_id: int) -> ExecutionPreview:
+    plan = ingest_repository.get_plan(connection, plan_id)
+    if plan is None:
+        raise PlanNotFoundError(f"No ingest plan with id {plan_id}")
+
+    readiness_result = audit_plan(connection, config, plan_id=plan_id)
+
+    destination_path: str | None = None
+    strategy: str | None = None
+    if plan.destination_directory is not None and plan.destination_filename is not None:
+        destination_path = str(PurePosixPath(plan.destination_directory) / plan.destination_filename)
+        if (
+            plan.destination_library is not None
+            and fs.path_exists(plan.source_path)
+            and fs.path_exists(plan.destination_library)
+        ):
+            source_device_id = fs.stat_device_id(plan.source_path)
+            destination_device_id = fs.stat_device_id(plan.destination_library)
+            strategy = decide_transfer_strategy(source_device_id, destination_device_id).value
+
+    return ExecutionPreview(
+        plan_id=plan_id,
+        plan_status=plan.status,
+        source_path=plan.source_path,
+        destination_path=destination_path,
+        transfer_strategy=strategy,
+        readiness_status=readiness_result.readiness_status.value,
+    )
+
+
 def execute_plan(
     connection: sqlite3.Connection,
     config: AppConfig,

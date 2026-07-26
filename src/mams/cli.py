@@ -15,6 +15,8 @@ from . import identification_repository
 from . import identification_service
 from . import ingest_repository
 from . import ingest_service
+from . import execution_repository
+from . import execution_service
 from . import provider_cache_repository
 from . import readiness
 from . import resolution_repository
@@ -311,6 +313,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_ingest_parser.add_argument("plan_id", type=int)
     audit_ingest_parser.add_argument("--json", action="store_true")
+
+    execute_ingest_parser = ingest_subs.add_parser(
+        "execute",
+        help="Execute one APPROVED, READY_FOR_EXECUTOR ingest plan. Modifies the filesystem -- requires --confirm-plan.",
+    )
+    execute_ingest_parser.add_argument("plan_id", type=int)
+    execute_ingest_parser.add_argument("--confirm-plan", dest="confirm_plan", type=int, default=None)
+    execute_ingest_parser.add_argument("--json", action="store_true")
+
+    executions_ingest_parser = ingest_subs.add_parser("executions", help="List Milestone 8 execution history. Read-only.")
+    executions_ingest_parser.add_argument("--plan-id", dest="plan_id", type=int, default=None)
+    executions_ingest_parser.add_argument(
+        "--status", type=str.upper, choices=["EXECUTING", "SUCCEEDED", "FAILED", "RECOVERY_REQUIRED"], default=None,
+    )
+    executions_ingest_parser.add_argument(
+        "--recovery-status",
+        dest="recovery_status",
+        type=str.upper,
+        choices=[
+            "NONE", "PARTIAL_DESTINATION_SOURCE_INTACT", "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED",
+            "DESTINATION_UNVERIFIED_SOURCE_REMOVED", "INVENTORY_REFRESH_INCOMPLETE",
+            "INTERRUPTED_STATE_UNKNOWN", "OTHER_REQUIRES_MANUAL_INSPECTION",
+        ],
+        default=None,
+    )
+    executions_ingest_parser.add_argument("--limit", type=int, default=None)
+    executions_ingest_parser.add_argument("--json", action="store_true")
+
+    execution_ingest_parser = ingest_subs.add_parser("execution", help="Show one execution's full step history. Read-only.")
+    execution_ingest_parser.add_argument("execution_id", type=int)
+    execution_ingest_parser.add_argument("--json", action="store_true")
+
+    recovery_ingest_parser = ingest_subs.add_parser(
+        "recovery", help="Read-only recovery guidance for one execution. Never mutates the database or filesystem."
+    )
+    recovery_ingest_parser.add_argument("execution_id", type=int)
+    recovery_ingest_parser.add_argument("--json", action="store_true")
 
     mediainfo_parser = subs.add_parser(
         "mediainfo", help="Show parsed MediaInfo metadata for a single file. Diagnostic only; read-only."
@@ -1704,13 +1743,23 @@ def run_ingest_approve(config: AppConfig, plan_id: int, *, json_output: bool = F
     return plan
 
 
-def _render_readiness_text(plan_id: int, result: readiness.ReadinessResult) -> str:
+def _render_readiness_text(
+    plan_id: int,
+    result: readiness.ReadinessResult,
+    *,
+    last_execution: execution_repository.ExecutionRecord | None = None,
+) -> str:
     lines = ["MAMS Execution-Readiness Audit", "=" * 30, "", f"Plan #{plan_id}", f"Status: {result.readiness_status.value}"]
     lines.append("")
     lines.append("Checks")
     for check in result.checks:
         marker = "PASS" if check.passed else "FAIL"
         lines.append(f"  {marker:<4}  {check.code}")
+    lines.append("")
+    if last_execution is not None:
+        lines.append(f"Last execution: #{last_execution.id} ({last_execution.status})")
+    else:
+        lines.append("Last execution: none")
     lines.append("")
     lines.append("EXECUTION WAS NOT PERFORMED.")
     return "\n".join(lines)
@@ -1723,7 +1772,13 @@ def run_ingest_audit(
     plan (Milestone 7C). Never executes anything -- see
     ingest_service.audit_plan/readiness.evaluate_readiness. Returns None
     (after printing a clear error, mutating nothing) for an unknown
-    plan_id."""
+    plan_id.
+
+    `readiness.py` stays pure and unaware of Milestone 8's execution
+    tables by design, so this function separately looks up the plan's
+    most recent execution (if any) and displays it alongside the
+    readiness result, rather than the audit itself gaining execution
+    awareness."""
     migrate(config.database_path)
     connection = connect(config.database_path)
     try:
@@ -1732,14 +1787,242 @@ def run_ingest_audit(
         except ingest_service.IngestPlanError as exc:
             console.print(f"[red]{exc}[/red]")
             return None
+        last_execution = execution_repository.get_current_execution_for_plan(connection, plan_id)
     finally:
         connection.close()
 
     if json_output:
-        console.print_json(data=result.to_dict())
+        data = result.to_dict()
+        data["last_execution"] = last_execution.to_dict() if last_execution is not None else None
+        console.print_json(data=data)
     else:
-        console.print(_render_readiness_text(plan_id, result))
+        console.print(_render_readiness_text(plan_id, result, last_execution=last_execution))
     return result
+
+
+def _render_execution_preview_text(preview: execution_service.ExecutionPreview) -> str:
+    lines = [
+        "MAMS Approved-Plan Execution",
+        "=" * 29,
+        "",
+        f"Plan:        #{preview.plan_id}",
+        f"Plan status: {preview.plan_status}",
+        f"Source:      {preview.source_path}",
+        f"Destination: {preview.destination_path or '(none)'}",
+        f"Strategy:    {preview.transfer_strategy or '(unknown -- source or destination root not reachable)'}",
+        "Overwrite:   DISABLED",
+        f"Audit:       {preview.readiness_status}",
+        "",
+        "This command will modify the filesystem.",
+        "",
+        "NO ACTIONS WERE EXECUTED.",
+        "",
+        "Re-run with:",
+        "",
+        f"  mams ingest execute {preview.plan_id} --confirm-plan {preview.plan_id}",
+        "",
+        "to execute this exact plan.",
+    ]
+    return "\n".join(lines)
+
+
+def _render_execution_result_text(execution: execution_repository.ExecutionRecord) -> str:
+    lines = [
+        "MAMS Ingest Execution",
+        "=" * 22,
+        "",
+        f"Execution: #{execution.id}",
+        f"Plan:      #{execution.ingest_plan_id}",
+        f"Status:    {execution.status}",
+        "",
+        "Source:",
+        f"  {execution.source_path}",
+        "",
+        "Destination:",
+        f"  {execution.destination_path}",
+        "",
+        "Strategy:",
+        f"  {execution.transfer_strategy}",
+    ]
+    if execution.status == "SUCCEEDED":
+        plex_line = execution.plex_refresh_status or "SKIPPED"
+        if plex_line == "SKIPPED":
+            plex_line += " -- disabled by configuration"
+        lines += [
+            "",
+            "Verification:",
+            "  PASS",
+            "",
+            "Inventory:",
+            "  Destination ACTIVE",
+            "  Source reconciled",
+            "",
+            "Plex:",
+            f"  {plex_line}",
+            "",
+            "Execution completed successfully.",
+        ]
+    else:
+        lines += [
+            "",
+            f"Execution {execution.status}.",
+            "",
+            f"Failed step:      {execution.failure_step}",
+            f"Recovery status:  {execution.recovery_status}",
+            "",
+            f"Run `mams ingest recovery {execution.id}` for full evidence and guidance.",
+            "Nothing was auto-retried.",
+        ]
+    return "\n".join(lines)
+
+
+def run_ingest_execute(
+    config: AppConfig, plan_id: int, *, confirm_plan: int | None, json_output: bool = False
+) -> execution_repository.ExecutionRecord | None:
+    """Execute one APPROVED, READY_FOR_EXECUTOR ingest plan. Requires an
+    exact `--confirm-plan` match for the same plan id; without it,
+    prints the preview and performs no filesystem or database mutation.
+    Returns None (after printing a clear error) for any usage-level
+    rejection -- see execution_service.ExecutionUsageError."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        try:
+            preview = execution_service.preview_execution(connection, config, plan_id=plan_id)
+        except execution_service.PlanNotFoundError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+
+        if confirm_plan != plan_id:
+            if json_output:
+                data = preview.to_dict()
+                data["confirmed"] = False
+                data["execution_status"] = "NOT_EXECUTED"
+                console.print_json(data=data)
+            else:
+                console.print(_render_execution_preview_text(preview))
+            return None
+
+        try:
+            execution = execution_service.execute_plan(connection, config, plan_id=plan_id)
+        except execution_service.ExecutionUsageError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=execution.to_dict())
+    else:
+        console.print(_render_execution_result_text(execution))
+    return execution
+
+
+def _render_executions_text(executions: list[execution_repository.ExecutionRecord]) -> str:
+    if not executions:
+        return "No matching executions."
+    lines = [f"{len(executions)} execution(s)", "", f"{'ID':<6} {'PLAN':<6} {'STATUS':<18} {'RECOVERY':<40} DESTINATION"]
+    for execution in executions:
+        lines.append(
+            f"{execution.id:<6} {execution.ingest_plan_id:<6} {execution.status:<18} "
+            f"{(execution.recovery_status or '-'):<40} {execution.destination_path}"
+        )
+    return "\n".join(lines)
+
+
+def run_ingest_executions(
+    config: AppConfig,
+    *,
+    plan_id: int | None = None,
+    status: str | None = None,
+    recovery_status: str | None = None,
+    limit: int | None = None,
+    json_output: bool = False,
+) -> list[execution_repository.ExecutionRecord]:
+    """List Milestone 8 execution history. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        executions = execution_repository.list_executions(
+            connection, status=status, recovery_status=recovery_status, plan_id=plan_id, limit=limit
+        )
+    finally:
+        connection.close()
+
+    if json_output:
+        console.print_json(data=[execution.to_dict() for execution in executions])
+    else:
+        console.print(_render_executions_text(executions))
+    return executions
+
+
+def run_ingest_execution(
+    config: AppConfig, execution_id: int, *, json_output: bool = False
+) -> execution_repository.ExecutionRecord | None:
+    """Show one execution's full step history. Read-only."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        execution = execution_repository.get_execution(connection, execution_id)
+    finally:
+        connection.close()
+
+    if execution is None:
+        console.print(f"[red]Execution {execution_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=execution.to_dict())
+    else:
+        console.print(_render_execution_result_text(execution))
+    return execution
+
+
+def _render_recovery_text(guidance: execution_service.RecoveryGuidance) -> str:
+    lines = [
+        "MAMS Execution Recovery",
+        "=" * 24,
+        "",
+        f"Execution: #{guidance.execution_id}",
+        f"Plan:      #{guidance.plan_id}",
+        f"Execution status: {guidance.execution_status}",
+        f"Recovery status:  {guidance.recovery_status}",
+        "",
+        f"Source exists:               {guidance.source_exists}",
+        f"Destination exists:          {guidance.destination_exists}",
+        f"Temp file exists:            {guidance.temp_file_exists}",
+        f"Lock held:                   {guidance.lock_held}",
+        f"Lock matches this execution: {guidance.lock_matches_execution}",
+        "",
+        "Recommendation:",
+        f"  {guidance.recommendation}",
+        "",
+        "NO ACTIONS WERE TAKEN. This command is read-only.",
+    ]
+    return "\n".join(lines)
+
+
+def run_ingest_recovery(
+    config: AppConfig, execution_id: int, *, json_output: bool = False
+) -> execution_service.RecoveryGuidance | None:
+    """Read-only recovery guidance for one execution. Never mutates the
+    database or filesystem -- see execution_service.inspect_recovery."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        guidance = execution_service.inspect_recovery(connection, config, execution_id=execution_id)
+    finally:
+        connection.close()
+
+    if guidance is None:
+        console.print(f"[red]Execution {execution_id} not found.[/red]")
+        return None
+
+    if json_output:
+        console.print_json(data=guidance.to_dict())
+    else:
+        console.print(_render_recovery_text(guidance))
+    return guidance
 
 
 def run_mediainfo(path: str, *, json_output: bool) -> mediainfo.MediaInfoOutcome:
@@ -1910,6 +2193,17 @@ def main() -> None:
             run_ingest_approve(config, args.plan_id, json_output=args.json)
         elif args.ingest_command == "audit":
             run_ingest_audit(config, args.plan_id, json_output=args.json)
+        elif args.ingest_command == "execute":
+            run_ingest_execute(config, args.plan_id, confirm_plan=args.confirm_plan, json_output=args.json)
+        elif args.ingest_command == "executions":
+            run_ingest_executions(
+                config, plan_id=args.plan_id, status=args.status, recovery_status=args.recovery_status,
+                limit=args.limit, json_output=args.json,
+            )
+        elif args.ingest_command == "execution":
+            run_ingest_execution(config, args.execution_id, json_output=args.json)
+        elif args.ingest_command == "recovery":
+            run_ingest_recovery(config, args.execution_id, json_output=args.json)
     elif args.command == "mediainfo":
         run_mediainfo(args.path, json_output=args.json)
 

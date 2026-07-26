@@ -53,3 +53,9 @@ verification:
   movie_min_runtime_minutes: 45
   episode_min_runtime_minutes: 15
   episode_max_runtime_minutes: 120
+
+execution:
+  checksum_algorithm: sha256
+  copy_buffer_bytes: 8388608
+  state_directory: "/Users/CHANGE_ME/Media Archive/.mams"
+  enable_plex_refresh: false
