@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.8.2
+
+Added category-scoped inventory scanning: `mams inventory scan --category
+CATEGORY [--metadata]` restricts discovery and reconciliation to exactly
+one configured category, instead of the roughly two hours a full
+`--metadata` scan takes against the production library (~3,500 files,
+5.9 TB). This makes the intended rolling ingest workflow -- rip one or
+two discs into `Incoming`, scan just `Incoming`, identify, resolve, plan,
+approve, audit, execute, free local disk space, repeat -- practical for
+the first time. See `docs/INGEST-WORKFLOW.md`'s new "Rolling ingest
+(Incoming-only)" section and `docs/ARCHITECTURE.md`'s "Milestone 8.2"
+entry.
+
+No new scoped code path was added to `inventory.py`, `mediainfo.py`, or
+`inventory_repository.py`: all three already operate on whatever
+category → root-path mapping they're given, so a scoped scan is simply a
+single-entry mapping passed through the same discovery/persistence
+pipeline a full scan uses. This is also why the safety invariant holds
+structurally: `mark_missing_files()` is only ever called for a category
+present in that mapping, so an unselected category's `libraries` row,
+`media_files` state/`last_seen_scan_id`, and `scan_changes` history are
+provably untouched by a scoped scan -- not merely untouched by today's
+tests. A missing/unmounted NAS root outside the selected category is
+never even `stat()`-ed, so an Incoming-only scan succeeds regardless of
+NAS mount state.
+
+`scan_runs` gains `scan_scope` (`FULL`/`CATEGORY`) and `scope_category`
+(migration `0015_scan_scope.sql`), so scan history distinguishes a full
+scan from a scoped one; every historical row, including the Milestone 8
+executor's `triggered_by='EXECUTION'` single-file refresh, defaults to
+`FULL`/`NULL`. An unknown `--category` lists the currently configured
+category names and exits non-zero; a repeated `--category` is rejected at
+parse time. A scoped scan writes `reports/library-{category}.json` /
+`reports/library-summary-{category}.txt` by default (never the full
+scan's `reports/library.json`), with a JSON envelope identifying the scan
+run id, scope, selected category, metadata flag, and start/completion
+time. Full-scan behavior, output, and report paths are unchanged.
+
+No multiple-category syntax, wildcard, `--all` alias, automatic
+identification/resolution/planning/execution, or metadata-caching
+redesign was introduced -- scanning remains entirely read-only against
+media files.
+
 ## 0.8.1
 
 Fixed a Milestone 8 defect discovered during the first real NAS

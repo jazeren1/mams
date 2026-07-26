@@ -119,3 +119,42 @@ in this codebase, so the step always records `SKIPPED`.
 There is no automatic retry: a failed or `RECOVERY_REQUIRED` execution
 requires an operator to inspect (`mams ingest recovery EXECUTION_ID`,
 strictly read-only) and generate a fresh plan for another attempt.
+
+## Milestone 8.2: category-scoped inventory scanning
+
+A full `mams inventory scan --metadata` walks and MediaInfo-probes every
+configured category — on the production library (~3,500 files, 5.9 TB)
+this takes roughly two hours, which is not viable for the intended
+rolling ingest workflow of ripping one or two discs into `Incoming` at a
+time (see `docs/INGEST-WORKFLOW.md`, "Rolling ingest (Incoming-only)").
+
+`mams inventory scan --category CATEGORY [--metadata]` restricts *both*
+discovery and reconciliation to exactly one configured category —
+typically `incoming`. This is not a new scanner: `inventory.py`'s
+filesystem walk, `mediainfo.py`'s probing, and
+`inventory_repository.py`'s reconciliation are all already generic over
+"whatever category → root-path mapping they're given"; a scoped scan
+simply passes a single-entry mapping through the same pipeline a full
+scan uses. Concretely, this means:
+
+- Categories absent from that mapping are never walked, never probed,
+  and never reconciled — `sync_libraries()` never touches their
+  `libraries` row, and `mark_missing_files()` (which flips stale `ACTIVE`
+  rows to `MISSING`) is only ever invoked for a category present in the
+  scan's result set, so it structurally cannot mark an unselected
+  category's files missing.
+- A missing/unmounted NAS root outside the selected category is never
+  even `stat()`-ed, let alone reported on — an Incoming-only scan
+  succeeds whether or not the NAS is mounted.
+- `scan_runs` gains `scan_scope` (`FULL`/`CATEGORY`) and
+  `scope_category`, so scan history distinguishes "walked everything"
+  from "walked just this one category" (see `docs/DATABASE.md`).
+- Scoped reports write to `reports/library-{category}.json` /
+  `reports/library-summary-{category}.txt` by default, never the
+  full-scan `reports/library.json` — a bare `--category CATEGORY` can
+  never overwrite the full-library report.
+
+Omitting `--category` preserves the original full-scan behavior exactly
+(same default report paths, same JSON/text shape). No identification,
+resolution, planning, or execution is triggered by a scan, scoped or
+not — that remains a separate, explicit step in the operator workflow.

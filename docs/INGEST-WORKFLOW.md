@@ -23,14 +23,17 @@ directories configured under `ingest.incoming_roots` in `config.yaml`.
 ### 2. Run inventory scan with metadata
 
 ```
-mams inventory scan --metadata
+mams inventory scan --category incoming --metadata
 ```
 
 Discovers the file (Incoming roots are scanned as additional categories
 automatically — see `docs/DATABASE.md`, "Incoming as a category") and
 probes it with `mediainfo` so verification later has real technical data
 to check. Read-only against the file itself; writes only to the
-database.
+database. `--category incoming` restricts this scan to just the
+`incoming` category — see "Rolling ingest (Incoming-only)" below for why
+this is the normal way to run this step. A periodic full audit (no
+`--category`) still works exactly as before.
 
 ### 3. Review findings
 
@@ -287,6 +290,53 @@ plain-English guidance. Strictly read-only — it never repairs or
 deletes anything; recovery requires an operator to look and decide.
 There is no `ingest retry` command: a failed execution requires
 generating a fresh plan, never reusing the stale one.
+
+## Rolling ingest (Incoming-only)
+
+A full `mams inventory scan --metadata` walks and MediaInfo-probes every
+configured category. On the production library (~3,500 files, 5.9 TB)
+this takes roughly two hours — not viable to run after every one or two
+discs when local `Incoming` space is limited. `mams inventory scan
+--category incoming --metadata` (Milestone 8.2) restricts discovery and
+reconciliation to just `incoming`, so this becomes the normal
+per-disc-batch step instead of a full audit.
+
+The rolling loop:
+
+1. Rip one or two discs into `Incoming`.
+2. Rename the ripped files using canonical, local, parse-friendly names
+   (`Title (Year).ext`, or a series/season layout) — see step 1/4 above
+   for how naming affects local identification confidence.
+3. `mams inventory scan --category incoming --metadata`
+4. `mams identify evaluate` then `mams identify list --category incoming`
+5. `mams resolve evaluate`
+6. `mams ingest plan MEDIA_FILE_ID --destination-category ...`, then
+   `mams ingest show PLAN_ID` to inspect it
+7. `mams ingest approve PLAN_ID`
+8. `mams ingest audit PLAN_ID`
+9. `mams ingest execute PLAN_ID --confirm-plan PLAN_ID` — one plan at a
+   time
+10. Verify the file landed correctly on the NAS
+11. Repeat once `Incoming` disk space is freed
+
+Notes on this loop:
+
+- `mams inventory scan --category incoming` never walks or probes
+  `movies`/`kids_movies`/`tv`/`kids_shows`/`fitness` (or any other
+  configured category) — it succeeds even if the NAS is unmounted, since
+  those roots are never inspected in the first place.
+- A category omitted from a scoped scan is never implied to be missing,
+  changed, or reconciled — its `media_files` rows, state, and scan
+  history are left exactly as they were before the scoped scan ran (see
+  `docs/DATABASE.md`, "Category-scoped scanning").
+- Scoped scanning is a **discovery/reconciliation step only** — it never
+  triggers identification, resolution, planning, or execution by itself,
+  same as a full scan.
+- A periodic full `mams inventory scan --metadata` (no `--category`)
+  remains the right tool for a whole-library audit; the scoped form is
+  for the per-disc-batch ingest loop specifically.
+- Scanning, scoped or full, is read-only with respect to media files —
+  it discovers and records, never moves, renames, or deletes anything.
 
 ## Quick reference: status vocabulary
 

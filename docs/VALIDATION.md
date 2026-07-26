@@ -1151,6 +1151,97 @@ primitive that assumed a filesystem capability SMB doesn't provide.
 
 ---
 
+# Milestone 8.2 – Category-Scoped Inventory Scanning
+
+Date: 2026-07-26
+
+## Summary
+
+`mams inventory scan --metadata` walks and MediaInfo-probes every
+configured category -- roughly two hours against the production
+library (~3,500 files, 5.9 TB). This is not viable for the intended
+rolling ingest workflow (rip one or two discs, scan, identify, resolve,
+plan, approve, audit, execute, free local space, repeat). This milestone
+adds `mams inventory scan --category CATEGORY [--metadata]`, restricting
+both discovery and reconciliation to exactly one configured category,
+with no new scoped code path in `inventory.py`, `mediainfo.py`, or
+`inventory_repository.py` -- all three already operate on whatever
+category -> root-path mapping they're given.
+
+## Validation Results
+
+- 1,229 automated tests passing (up from Milestone 8.1's 1,191) -- new
+  coverage in `tests/test_schema_scan_scope.py` (migration `0015`'s
+  `scan_scope`/`scope_category` columns and constraint) and
+  `tests/test_cli_inventory_scoped.py` (CLI parsing, unknown-category
+  error contract, filesystem-discovery scoping, metadata-probe call-count
+  scoping, reconciliation isolation, scan-run scope persistence, and
+  report separation).
+- Confirmed structurally, not just by test: `mark_missing_files()` is
+  only ever invoked (via `persist_scan()`'s loop over
+  `report.categories`) for a category present in the `categories` dict a
+  scan was given -- a category-scoped scan's `categories` dict has
+  exactly one entry, so no other library's files can ever be flipped to
+  `MISSING`, get a new `scan_changes` row, or have `last_seen_scan_id`
+  touched by it.
+- `test_scoped_incoming_scans_never_touch_movies_or_tv` and
+  `test_scoped_incoming_scan_never_marks_unrelated_categories_missing`
+  reproduce the exact failure mode this milestone must prevent: seed
+  `movies`/`tv` via a full scan, delete their files on disk, then run an
+  Incoming-only scoped scan and assert those rows are still `ACTIVE`
+  with an unchanged `last_seen_scan_id` and zero `MISSING` events -- a
+  naive full reconciliation would have marked them missing.
+- `test_incoming_only_scan_succeeds_while_nas_root_unavailable` points
+  the `movies` category at a nonexistent path and confirms a
+  `--category incoming` scan still succeeds and reports two files
+  discovered, proving the NAS root is never even `stat()`-ed for an
+  Incoming-only scan.
+- `test_two_incoming_files_produce_exactly_two_probe_calls` monkeypatches
+  `MediaInfoProvider.probe` to count invocations, confirming metadata
+  probing is scoped 1:1 to files in the selected category.
+- Manual smoke test against a throwaway `Movies`/`Incoming` tree (not the
+  production library) confirmed: an unknown `--category` prints the
+  configured category names and exits 1; a repeated `--category` is
+  rejected by argparse before any scan runs (exit 2); a scoped scan's
+  JSON/summary reports land at `reports/library-{category}.json` /
+  `reports/library-summary-{category}.txt` without touching
+  `reports/library.json`; and the unrelated category's file mtime was
+  unchanged after a scoped scan (never walked).
+- Ruff clean, MyPy clean.
+
+## Production Validation
+
+Not yet run. Per this milestone's own scope, only the scoped command
+itself may be validated against the real `/Users/johnzeren/Media
+Archive/Incoming` directory, and only after explicit operator approval
+of the exact command -- no ingest plan may be generated, approved, or
+executed as part of this validation. This section will be updated with
+the actual command, output, and confirmation that no NAS category was
+scanned once that approval and run have happened.
+
+## Quality Gates
+
+- 1,229 automated tests passing
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This milestone is the clearest evidence yet that this codebase's
+"scanner/repository are generic over a category -> root-path mapping"
+design decision (in place since Milestone 7B's Incoming-as-a-category
+work) was the right one: a feature that sounds like it needs a new
+scoped scanner, a new scoped persistence function, and new scoped
+reconciliation logic instead needed none of those -- it needed a
+single-entry dict passed through the pipeline that already existed, plus
+a schema column recording which case happened. The reconciliation-safety
+invariant this milestone promises isn't enforced by a new check bolted
+on top; it's a direct consequence of `persist_scan()`'s existing loop
+structure never having operated on anything outside the `categories`
+dict it's handed.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.

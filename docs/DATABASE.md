@@ -116,9 +116,24 @@ CREATE TABLE scan_runs (
     added_count INTEGER,
     updated_count INTEGER,
     missing_count INTEGER,
-    restored_count INTEGER
+    restored_count INTEGER,
+    -- added in 0014_ingest_executions.sql:
+    triggered_by TEXT NOT NULL CHECK (triggered_by IN ('SCAN','EXECUTION')) DEFAULT 'SCAN',
+    -- added in 0015_scan_scope.sql:
+    scan_scope TEXT NOT NULL CHECK (scan_scope IN ('FULL','CATEGORY')) DEFAULT 'FULL',
+    scope_category TEXT
 );
 ```
+
+`scan_scope`/`scope_category` (Milestone 8.2) distinguish a full
+`mams inventory scan` (`scan_scope='FULL'`, `scope_category=NULL`) from a
+`mams inventory scan --category CATEGORY` scan restricted to one
+configured category (`scan_scope='CATEGORY'`, `scope_category='CATEGORY'`).
+Every historical row, including a `triggered_by='EXECUTION'` targeted
+single-file refresh, defaults to `FULL`/`NULL` — neither concept existed
+before this column, so the default describes past rows accurately without
+rewriting history. See "Category-scoped scanning" below for the full
+reconciliation-scoping rationale.
 
 `mediainfo_version` records the `mediainfo` CLI tool's version (only
 meaningful when `metadata_enabled`), captured once per run via
@@ -698,6 +713,47 @@ regardless of year. Working around this for Incoming specifically would
 require relaxing a protected 7A test; deferred rather than done
 casually — see "Known limitations" in the Milestone 7B validation entry.
 
+### Category-scoped scanning (Milestone 8.2)
+
+`mams inventory scan --category CATEGORY` restricts a scan to exactly one
+configured category (typically `incoming`) — the normal rolling-ingest
+workflow, since a full metadata scan of the production library takes
+roughly two hours. This required **no new reconciliation code path**:
+`persist_scan()` (see "Import/update strategy" below) already syncs
+`libraries`, reconciles `media_files`, and calls `mark_missing_files()`
+only for whatever `categories` dict it's given — a category absent from
+that dict is never synced, never reconciled, and never has files flipped
+to `MISSING`. A scoped scan simply passes a single-entry `categories`
+dict through the exact same `persist_scan()` a full scan uses; there is
+no separate "scoped persist" function to keep in sync with the real one.
+
+Consequences that fall out of this structurally, not by convention:
+
+- An unselected category's `libraries` row, `media_files` rows (state,
+  `last_seen_scan_id`, all comparable fields), and `scan_changes` history
+  are provably untouched by a scoped scan — no query in `persist_scan()`
+  ever references a library outside the given `categories` dict.
+- A missing/unmounted NAS root outside the selected category is never
+  even `stat()`-ed — `scan_category()` only runs against roots present in
+  the dict it's handed, so an Incoming-only scan succeeds regardless of
+  NAS mount state.
+- `scan_runs.scan_scope`/`scope_category` (added by `0015_scan_scope.sql`,
+  see the `scan_runs` table above) record which of the two this run was;
+  everything else about a scoped scan's writes (change-event generation,
+  track replacement, `scan_runs` completion/failure semantics) is
+  identical to a full scan, just narrowed to one library.
+
+Reports mirror this scoping: a scoped scan's JSON report wraps the same
+`InventoryReport.to_dict()` shape (`file_count`/`total_size_bytes`/
+`categories`, with exactly one entry) in an envelope carrying
+`scan_scope`/`scope_category`/`metadata_enabled`/`scan_run_id`/
+`started_at`/`completed_at`, and defaults to
+`reports/library-{category}.json` /
+`reports/library-summary-{category}.txt` — never the full scan's
+`reports/library.json`, so a bare `--category CATEGORY` can never
+overwrite the full-library report. Omitting `--category` writes the
+unchanged full-scan report exactly as before.
+
 ### Resolution thresholds (Phase E policy)
 
 Constants in `resolution_service.py`: `AUTO_RESOLVE_MIN_SCORE = 0.90`,
@@ -1257,6 +1313,10 @@ Numbered, forward-only SQL files under `database/migrations/`:
   `ingest_execution_steps`, and their indexes, plus `ALTER TABLE
   scan_runs ADD COLUMN triggered_by` (same narrow-window caveat as
   `0003`/`0011`/`0012`).
+- `0015_scan_scope.sql` — Milestone 8.2: `ALTER TABLE scan_runs ADD
+  COLUMN scan_scope`/`scope_category` (same narrow-window caveat), so
+  scan history distinguishes a full scan from a `--category`-scoped one.
+  See "Category-scoped scanning" below.
 
 `schema_version` tracks the highest applied migration number. A migration
 runner applies any file numbered above the current version, in order,
@@ -1277,12 +1337,17 @@ idempotency mechanism for this one edge case was judged not worth adding.
 
 ## Import/update strategy
 
-Each `mams inventory scan` run, in one transaction:
+Each `mams inventory scan` run, in one transaction, against a `categories`
+dict that is either every configured category (full scan) or exactly one
+(`--category CATEGORY` — see "Category-scoped scanning" above; every step
+below is identical either way, just narrowed to that dict's entries):
 
 1. **Sync `libraries` from `config.yaml`**: upsert by `category` — insert
    new categories, update `root_path` if changed, bump `updated_at`.
+   Categories outside this scan's `categories` dict are never touched.
 2. Insert a `scan_runs` row (`status='RUNNING'`), recording
-   `mediainfo_version` up front if `--metadata` is set.
+   `scan_scope`/`scope_category` and `mediainfo_version` up front if
+   `--metadata` is set.
 3. Walk the NAS exactly as today — unchanged, read-only. Capture
    `st_mtime` from the same `stat()` call already used for `size_bytes`.
 4. Upsert `media_files` by `absolute_path`
