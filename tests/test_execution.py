@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from mams.execution import (
+    DestinationVerificationInput,
     ExecutionStepType,
     FaultPoint,
     PreflightInput,
@@ -16,7 +17,9 @@ from mams.execution import (
     build_execution_step_plan,
     decide_transfer_strategy,
     evaluate_preflight,
+    verify_destination,
 )
+from mams.verification import CheckStatus, VerificationStatus
 
 
 def test_same_device_id_selects_same_filesystem_strategy() -> None:
@@ -260,3 +263,143 @@ def test_unsupported_checksum_algorithm_blocks() -> None:
     result = evaluate_preflight(_ready_preflight_input(checksum_algorithm_supported=False))
     assert result.all_passed is False
     assert "checksum_algorithm_supported" in _failed_preflight_codes(result)
+
+
+# --- verify_destination ----------------------------------------------------------
+
+
+def _ready_destination_input(**overrides: object) -> DestinationVerificationInput:
+    base = DestinationVerificationInput(
+        destination_path="/NAS/Movies/Alien (1979)/Alien (1979).mkv",
+        plan_destination_path="/NAS/Movies/Alien (1979)/Alien (1979).mkv",
+        destination_exists=True,
+        destination_is_regular_file=True,
+        destination_size_bytes=1_000_000,
+        expected_size_bytes=1_000_000,
+        media_info_probed=True,
+        media_info_error=None,
+        container="Matroska",
+        extension=".mkv",
+        duration_seconds=6000.0,
+        video_track_count=1,
+        audio_track_count=1,
+        checksum_required=False,
+        source_checksum=None,
+        destination_checksum=None,
+    )
+    return replace(base, **overrides)  # type: ignore[arg-type]
+
+
+def _destination_check_status(result, code: str) -> CheckStatus:  # type: ignore[no-untyped-def]
+    for check in result.checks:
+        if check.code == code:
+            return check.status
+    raise AssertionError(f"no check with code {code!r}")
+
+
+def test_fully_verified_destination_passes() -> None:
+    result = verify_destination(_ready_destination_input())
+    assert result.status == VerificationStatus.PASS
+
+
+def test_never_probed_destination_short_circuits_to_not_probed() -> None:
+    result = verify_destination(_ready_destination_input(media_info_probed=False))
+    assert result.status == VerificationStatus.NOT_PROBED
+    # Existence/path/size checks still ran even though probing never happened.
+    assert _destination_check_status(result, "destination_file_exists") == CheckStatus.PASS
+    assert _destination_check_status(result, "destination_size_matches_expected") == CheckStatus.PASS
+
+
+def test_missing_destination_fails() -> None:
+    result = verify_destination(_ready_destination_input(destination_exists=False))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_file_exists") == CheckStatus.FAIL
+
+
+def test_destination_not_a_regular_file_fails() -> None:
+    result = verify_destination(_ready_destination_input(destination_is_regular_file=False))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_is_regular_file") == CheckStatus.FAIL
+
+
+def test_destination_path_mismatch_fails() -> None:
+    result = verify_destination(_ready_destination_input(destination_path="/NAS/Movies/Wrong.mkv"))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_path_matches_plan_destination") == CheckStatus.FAIL
+
+
+def test_zero_byte_destination_fails() -> None:
+    result = verify_destination(_ready_destination_input(destination_size_bytes=0))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_size_non_zero") == CheckStatus.FAIL
+
+
+def test_destination_size_mismatch_fails() -> None:
+    result = verify_destination(_ready_destination_input(destination_size_bytes=999))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_size_matches_expected") == CheckStatus.FAIL
+
+
+def test_media_info_error_fails() -> None:
+    result = verify_destination(_ready_destination_input(media_info_error="probe failed"))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_metadata_probed") == CheckStatus.FAIL
+
+
+def test_missing_container_fails() -> None:
+    result = verify_destination(_ready_destination_input(container=None))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_container_present") == CheckStatus.FAIL
+
+
+def test_missing_duration_fails() -> None:
+    result = verify_destination(_ready_destination_input(duration_seconds=None))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_duration_present_and_positive") == CheckStatus.FAIL
+
+
+def test_no_video_track_fails() -> None:
+    result = verify_destination(_ready_destination_input(video_track_count=0))
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_video_track_present") == CheckStatus.FAIL
+
+
+def test_no_audio_track_warns_not_fails() -> None:
+    result = verify_destination(_ready_destination_input(audio_track_count=0))
+    assert result.status == VerificationStatus.WARNING
+    assert _destination_check_status(result, "destination_audio_track_present") == CheckStatus.WARNING
+
+
+def test_implausible_extension_warns() -> None:
+    result = verify_destination(_ready_destination_input(extension=".mp4"))
+    assert result.status == VerificationStatus.WARNING
+    assert _destination_check_status(result, "destination_container_extension_plausible") == CheckStatus.WARNING
+
+
+def test_same_filesystem_strategy_marks_checksum_not_applicable_and_passes() -> None:
+    result = verify_destination(_ready_destination_input(checksum_required=False))
+    assert _destination_check_status(result, "destination_checksum_matches_source_checksum") == CheckStatus.PASS
+
+
+def test_cross_filesystem_matching_checksums_pass() -> None:
+    result = verify_destination(
+        _ready_destination_input(checksum_required=True, source_checksum="abc123", destination_checksum="abc123")
+    )
+    assert result.status == VerificationStatus.PASS
+    assert _destination_check_status(result, "destination_checksum_matches_source_checksum") == CheckStatus.PASS
+
+
+def test_cross_filesystem_checksum_mismatch_fails() -> None:
+    result = verify_destination(
+        _ready_destination_input(checksum_required=True, source_checksum="abc123", destination_checksum="def456")
+    )
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_checksum_matches_source_checksum") == CheckStatus.FAIL
+
+
+def test_cross_filesystem_missing_checksum_fails() -> None:
+    result = verify_destination(
+        _ready_destination_input(checksum_required=True, source_checksum="abc123", destination_checksum=None)
+    )
+    assert result.status == VerificationStatus.FAIL
+    assert _destination_check_status(result, "destination_checksum_matches_source_checksum") == CheckStatus.FAIL

@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from .verification import PLAUSIBLE_EXTENSIONS_BY_CONTAINER, CheckStatus, VerificationStatus
+
 
 class TransferStrategy(StrEnum):
     SAME_FILESYSTEM_ATOMIC_RENAME = "SAME_FILESYSTEM_ATOMIC_RENAME"
@@ -290,3 +292,173 @@ def evaluate_preflight(data: PreflightInput) -> PreflightResult:
     _check("checksum_algorithm_supported", data.checksum_algorithm_supported)
 
     return PreflightResult(all_passed=all(check.passed for check in checks), checks=tuple(checks))
+
+
+@dataclass(frozen=True)
+class DestinationVerificationInput:
+    """Everything `verify_destination()` needs, gathered by
+    `execution_service.execute_plan()` from a *fresh* post-transfer
+    `stat()` and a *fresh* MediaInfo probe of the destination file --
+    never from the plan-time verification snapshot, which describes the
+    source file before it ever moved and says nothing about what
+    actually landed at the destination.
+
+    `checksum_required` is True only for the cross-filesystem strategy
+    (a real byte-for-byte copy occurred, so an independent checksum is
+    the actual proof of integrity); the same-filesystem strategy moves
+    the same inode via a hard link, so byte-identity is structural, not
+    something a second checksum needs to prove."""
+
+    destination_path: str
+    plan_destination_path: str
+    destination_exists: bool
+    destination_is_regular_file: bool
+    destination_size_bytes: int | None
+    expected_size_bytes: int
+
+    media_info_probed: bool
+    media_info_error: str | None
+    container: str | None
+    extension: str
+    duration_seconds: float | None
+    video_track_count: int
+    audio_track_count: int
+
+    checksum_required: bool
+    source_checksum: str | None
+    destination_checksum: str | None
+
+
+@dataclass(frozen=True)
+class DestinationVerificationCheck:
+    code: str
+    status: CheckStatus
+    evidence: dict[str, object]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"code": self.code, "status": self.status.value, "evidence": self.evidence}
+
+
+@dataclass(frozen=True)
+class DestinationVerificationResult:
+    status: VerificationStatus
+    checks: tuple[DestinationVerificationCheck, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"status": self.status.value, "checks": [check.to_dict() for check in self.checks]}
+
+
+def verify_destination(data: DestinationVerificationInput) -> DestinationVerificationResult:
+    """Run the post-transfer destination checks and derive an overall
+    status. Precedence identical to `verification.verify_media`:
+    `NOT_PROBED` if MediaInfo never ran against the destination at all
+    (nothing further about tracks/duration can be assessed), else `FAIL`
+    if any check failed, else `WARNING` if any check warned, else
+    `PASS`. Short-circuits on `NOT_PROBED` exactly as `verify_media`
+    does -- the checks that don't need MediaInfo (existence, path,
+    size) still run first and are still reported."""
+    checks: list[DestinationVerificationCheck] = []
+
+    def _check(code: str, status: CheckStatus, **evidence: object) -> None:
+        checks.append(DestinationVerificationCheck(code=code, status=status, evidence=evidence))
+
+    _check(
+        "destination_file_exists",
+        CheckStatus.PASS if data.destination_exists else CheckStatus.FAIL,
+    )
+    _check(
+        "destination_is_regular_file",
+        CheckStatus.PASS if data.destination_exists and data.destination_is_regular_file else CheckStatus.FAIL,
+    )
+    _check(
+        "destination_path_matches_plan_destination",
+        CheckStatus.PASS if data.destination_path == data.plan_destination_path else CheckStatus.FAIL,
+        destination_path=data.destination_path,
+        plan_destination_path=data.plan_destination_path,
+    )
+    _check(
+        "destination_size_non_zero",
+        CheckStatus.PASS
+        if data.destination_exists and data.destination_size_bytes is not None and data.destination_size_bytes > 0
+        else CheckStatus.FAIL,
+        size_bytes=data.destination_size_bytes,
+    )
+    _check(
+        "destination_size_matches_expected",
+        CheckStatus.PASS
+        if data.destination_exists and data.destination_size_bytes == data.expected_size_bytes
+        else CheckStatus.FAIL,
+        expected_size_bytes=data.expected_size_bytes,
+        actual_size_bytes=data.destination_size_bytes,
+    )
+
+    if not data.media_info_probed:
+        _check("destination_metadata_probed", CheckStatus.FAIL, probed=False)
+        return DestinationVerificationResult(status=VerificationStatus.NOT_PROBED, checks=tuple(checks))
+
+    _check(
+        "destination_metadata_probed",
+        CheckStatus.FAIL if data.media_info_error else CheckStatus.PASS,
+        probed=True,
+        error=data.media_info_error,
+    )
+    _check(
+        "destination_container_present",
+        CheckStatus.PASS if data.container else CheckStatus.FAIL,
+        container=data.container,
+    )
+    duration_ok = data.duration_seconds is not None and data.duration_seconds > 0
+    _check(
+        "destination_duration_present_and_positive",
+        CheckStatus.PASS if duration_ok else CheckStatus.FAIL,
+        duration_seconds=data.duration_seconds,
+    )
+    _check(
+        "destination_video_track_present",
+        CheckStatus.PASS if data.video_track_count >= 1 else CheckStatus.FAIL,
+        video_track_count=data.video_track_count,
+    )
+    # Missing audio is a WARNING, not a FAIL -- same conservative
+    # convention as verify_media's audio_track_present check.
+    _check(
+        "destination_audio_track_present",
+        CheckStatus.PASS if data.audio_track_count >= 1 else CheckStatus.WARNING,
+        audio_track_count=data.audio_track_count,
+    )
+    plausible_extensions = PLAUSIBLE_EXTENSIONS_BY_CONTAINER.get(data.container or "")
+    if plausible_extensions is not None:
+        _check(
+            "destination_container_extension_plausible",
+            CheckStatus.PASS if data.extension.lower() in plausible_extensions else CheckStatus.WARNING,
+            container=data.container,
+            extension=data.extension,
+        )
+
+    if data.checksum_required:
+        checksum_match = (
+            data.source_checksum is not None
+            and data.destination_checksum is not None
+            and data.source_checksum == data.destination_checksum
+        )
+        _check(
+            "destination_checksum_matches_source_checksum",
+            CheckStatus.PASS if checksum_match else CheckStatus.FAIL,
+            source_checksum=data.source_checksum,
+            destination_checksum=data.destination_checksum,
+        )
+    else:
+        _check(
+            "destination_checksum_matches_source_checksum",
+            CheckStatus.PASS,
+            not_applicable=True,
+            reason="same-filesystem move preserves the original inode; no independent checksum is computed",
+        )
+
+    if any(check.status == CheckStatus.FAIL for check in checks):
+        overall = VerificationStatus.FAIL
+    elif any(check.status == CheckStatus.WARNING for check in checks):
+        overall = VerificationStatus.WARNING
+    else:
+        overall = VerificationStatus.PASS
+
+    return DestinationVerificationResult(status=overall, checks=tuple(checks))
