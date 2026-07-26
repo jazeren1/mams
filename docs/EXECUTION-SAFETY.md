@@ -132,9 +132,62 @@ prefix:
   verifiable, which `shutil.move`'s cross-filesystem fallback would
   hide. The temporary file (`.{filename}.mams-partial-{token}`) is
   always written *inside* the final destination directory, so the
-  final commit (temp → final) is always a same-device operation and
-  reuses the exact same no-clobber `os.link`+`os.unlink` primitive as
-  the same-filesystem strategy.
+  final commit (temp → final) is always a same-directory operation --
+  but it does **not** reuse the same-filesystem strategy's
+  `os.link`+`os.unlink` primitive. See "Cross-filesystem finalization"
+  below for why, and for what it uses instead.
+
+### Cross-filesystem finalization (`finalize_verified_temp_file`)
+
+Real NAS acceptance of a plan against an SMB-mounted destination
+(`mams ingest execute 1 --confirm-plan 1`, execution #1) failed at
+`FINAL_RENAME` with `[Errno 45] Operation not supported` from
+`os.link()`: SMB does not support hard links even between two paths
+`os.stat()` reports as the same device. `finalize_same_device_move()`
+(the original shared commit primitive) was renamed to
+`finalize_same_filesystem_source_move()` and is now used **only** by
+the same-filesystem strategy; the cross-filesystem strategy's temp →
+final commit uses a distinct primitive,
+`execution_filesystem.finalize_verified_temp_file()`, that never calls
+`os.link()`:
+
+1. Preconditions, checked immediately before any mutation: temp and
+   final share a parent directory; neither path is a symlink; the temp
+   path is a regular file (`lstat`); the final path is absent
+   (`lexists`). Any violation raises
+   `FinalizationPreconditionError`/`DestinationCollisionError` with
+   nothing touched.
+2. **Primary**: a tightly-scoped `ctypes` adapter for macOS's
+   `renamex_np(2)` called with the `RENAME_EXCL` flag — an OS-native
+   atomic no-clobber rename, analogous to Linux's
+   `renameat2(RENAME_NOREPLACE)`. Documented by Apple as supported on
+   APFS/HFS+; not guaranteed elsewhere.
+3. **Fallback**, used when (2) reports `ENOTSUP`/`EOPNOTSUPP` (as SMB
+   does) or isn't available at all: a lock-protected compatibility path
+   — re-check the destination is absent, re-check the parent directory
+   is real, re-check the temp file is still a regular file, then
+   `os.rename(temp, final)`, then an immediate postcondition check. This
+   path is **not** fully race-free: `os.rename()` on POSIX silently
+   overwrites an existing destination, so a file created at the final
+   path by an unrelated process in the narrow window between the
+   `lstat` check and the `os.rename()` call would be silently
+   destroyed. This is a documented, accepted limitation of running
+   against a filesystem that offers no stronger primitive of its own —
+   narrowed as far as this codebase can narrow it (the plan's exclusive
+   execution lock plus fresh preflight already rule out anything *this*
+   codebase would write to the same path concurrently), never pretended
+   away.
+4. On success, the destination directory is `fsync`ed on a best-effort
+   basis (some filesystems, network mounts especially, don't support
+   directory `fsync` at all; that failure is swallowed, since the
+   rename itself already succeeded and directory-entry durability is
+   not a correctness requirement here).
+
+Never calls `os.replace()`, `shutil.move()`, deletes/overwrites an
+existing destination, or appends a "copy"/numeric-suffix/alternate
+filename — a real collision is always `DestinationCollisionError`,
+never silently worked around. No automatic retry: an unsupported
+primitive triggers exactly one fallback attempt, never a loop.
 
 ## Checksum policy
 
@@ -157,10 +210,18 @@ the move.
 
 Enforced structurally, not just by a pre-check:
 
-- `finalize_same_device_move()` (the shared commit primitive for both
-  strategies) uses `os.link()`, which raises `FileExistsError`
-  natively and atomically if the destination exists — there is no
-  window between "check" and "write" for a real NAS mount to race.
+- `finalize_same_filesystem_source_move()` (same-filesystem strategy)
+  uses `os.link()`, which raises `FileExistsError` natively and
+  atomically if the destination exists — there is no window between
+  "check" and "write" for a real NAS mount to race.
+- `finalize_verified_temp_file()` (cross-filesystem strategy) uses
+  macOS's native `renamex_np(..., RENAME_EXCL)` where the destination
+  filesystem supports it (atomic, OS-enforced no-clobber), and a
+  lock-protected `lstat`-then-`os.rename()` fallback with a documented,
+  narrowed TOCTOU window where it doesn't (see "Cross-filesystem
+  finalization" above). Neither path ever calls `os.replace()` or
+  `shutil.move()`, and a real collision always raises
+  `DestinationCollisionError` rather than silently overwriting.
 - Preflight independently confirms the destination path does not exist
   and the destination directory isn't occupied by a plain file,
   immediately before any mutation.
@@ -253,11 +314,18 @@ a partial copy is retained as recovery evidence, never resumed and
 never cleaned up automatically.
 
 `mams ingest recovery EXECUTION_ID` is strictly read-only: it re-derives
-live evidence (does the source exist? the destination? a
-`.mams-partial-*` temp file? does the lock file exist and match the
-recorded token?) and returns plain-English guidance. It never mutates
-the database or the filesystem, and never repairs anything — recovery
-requires an operator to look and decide.
+live evidence (does the source exist? the destination? does the lock
+file exist and match the recorded token?) and returns plain-English
+guidance. It never mutates the database or the filesystem, and never
+repairs anything — recovery requires an operator to look and decide.
+
+It scans the destination directory for names matching the *exact*
+recorded naming pattern `.{final-filename}.mams-partial-*` (never a
+bare `.mams-partial-*` glob, which could match a different plan's
+in-flight temp file in the same directory) and reports every discovered
+path verbatim, both as `temp_file_paths` (JSON) and inline in the
+`RecoveryGuidance` recommendation text — an operator is never left to
+guess the token or reconstruct the filename by hand.
 
 ## Retry policy
 

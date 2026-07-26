@@ -985,6 +985,172 @@ remains unverified until the runbook above is completed.
 
 ---
 
+# Milestone 8.1 – Cross-Filesystem Finalization Fix (Real NAS Acceptance Failure)
+
+Date: 2026-07-26
+
+## Summary
+
+Milestone 8's real-NAS acceptance runbook was attempted for the first
+time and failed: `mams ingest execute 1 --confirm-plan 1` reached
+`RECOVERY_REQUIRED` at the `FINAL_RENAME` step. This entry records that
+failure accurately, its root cause, and the fix -- `execution_1` and
+`ingest_plan_1` are retained exactly as the failure produced them and
+are not reused or modified by anything below.
+
+## Production Acceptance Attempt (Failed)
+
+**Command:** `python -m mams.cli ingest execute 1 --confirm-plan 1`
+
+**Result, queried directly from `ingest_executions`/`ingest_execution_steps`
+row id 1:**
+
+- Plan #1, Execution #1
+- Strategy: `CROSS_FILESYSTEM_COPY_VERIFY_REMOVE`
+- Steps 1-5 (`VALIDATE_SOURCE` through `VERIFY_CHECKSUM_MATCH`) all
+  `SUCCEEDED`
+- Step 6 `FINAL_RENAME` `FAILED`; steps 7-11 never ran (`PENDING`)
+- Execution status: `RECOVERY_REQUIRED`
+- Recovery status: `PARTIAL_DESTINATION_SOURCE_INTACT`
+- Recorded `failure_message`: `[Errno 45] Operation not supported:
+  '/Volumes/NASMedia/Movies/District 9 (2009)/.District 9 (2009).mkv.mams-partial-824e39f7512a248d5f4e57bf99326dfe'
+  -> '/Volumes/NASMedia/Movies/District 9 (2009)/District 9 (2009).mkv'`
+- Source (`/Users/johnzeren/Media Archive/Incoming/District 9
+  (2009).mkv`) remained intact -- never touched
+- Final destination (`/Volumes/NASMedia/Movies/District 9
+  (2009)/District 9 (2009).mkv`) never existed
+- The temporary NAS file was fully copied, flushed, `fsync`ed, and
+  checksum-verified before the failure; it was manually removed by the
+  operator, leaving an empty `District 9 (2009)` destination directory
+- The execution lock was released on the failure path, as designed
+
+No data was lost or put at risk: the executor's every safety guarantee
+held under this exact real-world failure (nothing was overwritten,
+nothing was deleted before verification, the source was never touched).
+The failure was a completeness gap, not a safety gap.
+
+## Root Cause
+
+`execution_filesystem.finalize_same_device_move()` (the pre-fix commit
+primitive, shared by both transfer strategies) used
+`os.link()`+`os.unlink()` for its no-clobber guarantee. The
+production NAS destination is mounted over SMB. SMB does not support
+hard links even between two paths `os.stat()` reports as the same
+device (`st_dev` compares equal because SMB clients typically report
+one device id for the whole share) -- so `os.link()` raised `[Errno 45]
+Operation not supported` (`ENOTSUP`) exactly at the temp-to-final commit
+step, after every prior step (copy, flush, `fsync`, checksum,
+checksum-match) had already succeeded.
+
+## Fix
+
+`execution_filesystem.py` now has two distinct finalization primitives
+instead of one shared one:
+
+- `finalize_same_filesystem_source_move()` -- unchanged `os.link()`+
+  `os.unlink()` behavior, now used only by the `SAME_FILESYSTEM_ATOMIC_RENAME`
+  strategy (which needs true hard-link semantics to move an original
+  source file without a second copy).
+- `finalize_verified_temp_file()` -- new, used only by
+  `CROSS_FILESYSTEM_COPY_VERIFY_REMOVE`'s temp-to-final commit. Never
+  calls `os.link()`. Tries macOS's native `renamex_np(...,
+  RENAME_EXCL)` first (an atomic, OS-enforced no-clobber rename,
+  supported on APFS/HFS+), and falls back to a lock-protected,
+  documented-limitation `lstat`-then-`os.rename()` path when that's
+  unsupported (as it is on SMB). Full design in
+  `docs/EXECUTION-SAFETY.md`'s "Cross-filesystem finalization" section.
+
+`inspect_recovery()`'s temp-file detection already used the exact
+naming pattern `.{final-filename}.mams-partial-{token}` rather than a
+generic glob (confirmed by direct code review before this fix); what it
+lacked was reporting the *exact discovered path* rather than only a
+boolean. `RecoveryGuidance` now carries `temp_file_paths`, surfaced in
+both JSON output and the recommendation text `mams ingest recovery`
+prints.
+
+## Validation Results
+
+- 1,191 automated tests passing (up from Milestone 8's 1,180) — new
+  coverage: `finalize_verified_temp_file()`'s no-clobber guarantee, its
+  `renamex_np`/fallback split, symlink/parent-directory-mismatch
+  rejection, best-effort directory `fsync`, and a regression test that
+  reproduces the exact production failure shape (`os.link()`
+  monkeypatched to raise `errno.ENOTSUP`) end to end through
+  `execute_plan()`, asserting the cross-filesystem strategy now reaches
+  `SUCCEEDED`/`EXECUTED` with the source removed only after destination
+  verification passes.
+- Ruff clean, MyPy clean.
+- Confirmed `os.link` is never invoked anywhere in the cross-filesystem
+  finalization path (a monkeypatched `os.link` that raises
+  `AssertionError` if called still passes).
+- Confirmed `ingest_executions` row id 1 and `ingest_plans` row id 1 are
+  byte-for-byte unchanged by this fix (re-queried directly from
+  `database/mams.db` after implementation).
+- Not run against the real NAS, per this fix's own scope -- see the
+  retry runbook below.
+
+## Real-Acceptance Retry Runbook (to be completed by the operator)
+
+Execution #1 and Plan #1 are historical evidence of the fixed defect
+and must not be reused or re-executed. This retry uses a **new** plan
+and a **new** execution, following the same disposable-copy procedure
+as Milestone 8's original runbook:
+
+1. Confirm the previously-manually-removed temporary file and the
+   now-empty `NAS/Movies/District 9 (2009)` directory are still exactly
+   as recovery left them (or, at your discretion, remove the empty
+   directory manually -- it contains no media).
+2. Choose one small, valid movie file (the same disposable `District 9`
+   copy is fine, or a different one). **Do not use the only copy.**
+3. Copy the disposable copy into a configured `ingest.incoming_roots`
+   directory.
+4. `mams inventory scan --metadata`
+5. `mams findings evaluate` / `mams identify evaluate` -- confirm no
+   blocking findings.
+6. `mams resolve evaluate` (or `mams resolve select` for a manual
+   match) -- confirm an `ACTIVE` assignment exists.
+7. `mams ingest plan MEDIA_FILE_ID --destination-category ...` --
+   confirm `READY_FOR_REVIEW`. This produces a **new plan id**, not
+   plan #1.
+8. `mams ingest approve NEW_PLAN_ID`
+9. `mams ingest audit NEW_PLAN_ID` -- confirm `READY_FOR_EXECUTOR`.
+10. `mams ingest execute NEW_PLAN_ID` -- review the preview text.
+11. `mams ingest execute NEW_PLAN_ID --confirm-plan NEW_PLAN_ID` --
+    execute for real. This produces a **new execution id**.
+12. Verify the destination file plays correctly in VLC.
+13. Verify the source file is gone from Incoming.
+14. `mams ingest execution NEW_EXECUTION_ID` -- confirm `SUCCEEDED`.
+15. `mams inventory list --category movies` -- confirm the destination
+    is `ACTIVE` in canonical inventory.
+16. Record the exact commands run, the new plan/execution ids, and the
+    outcome in a future validation entry.
+
+**Real acceptance is not considered successful until this retry
+completes with `SUCCEEDED`.** This entry does not claim that outcome --
+only the code, tests, and documentation fix are complete.
+
+## Quality Gates
+
+- 1,191 automated tests passing
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This is direct evidence that Milestone 8's layered safety model works
+as designed under a real, previously-untested failure mode: a mutation
+primitive assumption (`os.link()` support) that held for every local
+filesystem tested turned out to be false for the actual production NAS
+mount, and the executor's response was exactly what
+`docs/EXECUTION-SAFETY.md` promises -- a clean `RECOVERY_REQUIRED`
+outcome with the source untouched, the destination never partially
+written under its final name, and clear recorded evidence, rather than
+a silent partial write or a corrupted destination. The fix itself
+preserves every one of those guarantees while replacing only the one
+primitive that assumed a filesystem capability SMB doesn't provide.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.

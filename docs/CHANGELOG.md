@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.1
+
+Fixed a Milestone 8 defect discovered during the first real NAS
+acceptance run: `mams ingest execute PLAN_ID --confirm-plan PLAN_ID`'s
+`CROSS_FILESYSTEM_COPY_VERIFY_REMOVE` strategy failed at `FINAL_RENAME`
+with `[Errno 45] Operation not supported`, because its finalization
+primitive relied on `os.link()`, which the production SMB-mounted NAS
+destination does not support even between two paths reporting the same
+device id. The source remained intact, the destination never existed
+under its final name, and the execution correctly recorded
+`RECOVERY_REQUIRED` -- a completeness gap, not a safety gap. Full
+incident record in `docs/VALIDATION.md`'s "Milestone 8.1" entry.
+
+`execution_filesystem.py` now has two distinct finalization primitives
+instead of one shared one: `finalize_same_filesystem_source_move()`
+(unchanged `os.link()`+`os.unlink()`, used only by the
+`SAME_FILESYSTEM_ATOMIC_RENAME` strategy) and
+`finalize_verified_temp_file()` (new, used only by the cross-filesystem
+strategy's temp-to-final commit). The new primitive never calls
+`os.link()`: it tries macOS's native `renamex_np(..., RENAME_EXCL)`
+atomic no-clobber rename first, and falls back to a lock-protected,
+explicitly-documented-limitation `lstat`-then-`os.rename()` path when
+that's unsupported, as on SMB. Neither primitive ever calls
+`os.replace()` or `shutil.move()`, and a real destination collision
+always raises `DestinationCollisionError` rather than overwriting or
+silently choosing an alternate filename. Full design in
+`docs/EXECUTION-SAFETY.md`'s "Cross-filesystem finalization" section.
+
+`mams ingest recovery EXECUTION_ID` now reports the exact discovered
+temporary-file path(s) (`RecoveryGuidance.temp_file_paths`), not just a
+boolean, in both JSON and text output.
+
+No retry, force, overwrite, automatic cleanup, or alternate-filename
+behavior was introduced. Execution #1 and Plan #1 (the historical
+failure record from the real acceptance attempt) were not modified.
+
 ## 0.8.0
 
 Added Milestone 8: safe, one-plan-at-a-time approved-plan execution --
