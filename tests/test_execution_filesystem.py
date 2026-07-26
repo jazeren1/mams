@@ -7,16 +7,21 @@ disk/filesystem-level failure that `tmp_path` alone can't produce).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 from pathlib import Path
 
 import pytest
 
+from mams import execution_filesystem as fs_module
 from mams.execution_filesystem import (
+    DestinationCollisionError,
+    FinalizationPreconditionError,
     checksum_file,
     create_destination_directory,
-    finalize_same_device_move,
+    finalize_same_filesystem_source_move,
+    finalize_verified_temp_file,
     free_space_bytes,
     is_directory,
     is_readable,
@@ -210,35 +215,35 @@ def test_checksum_file_is_independent_of_stream_copy_hash(tmp_path: Path) -> Non
     assert first_checksum != second_checksum
 
 
-# --- finalize_same_device_move ----------------------------------------------------
+# --- finalize_same_filesystem_source_move ------------------------------------------
 
 
-def test_finalize_same_device_move_links_then_unlinks_source(tmp_path: Path) -> None:
+def test_finalize_same_filesystem_source_move_links_then_unlinks_source(tmp_path: Path) -> None:
     source = tmp_path / "source.mkv"
     final = tmp_path / "final.mkv"
     source.write_bytes(b"payload")
 
-    finalize_same_device_move(str(source), str(final))
+    finalize_same_filesystem_source_move(str(source), str(final))
 
     assert not source.exists()
     assert final.read_bytes() == b"payload"
 
 
-def test_finalize_same_device_move_refuses_to_overwrite_existing_final_path(tmp_path: Path) -> None:
+def test_finalize_same_filesystem_source_move_refuses_to_overwrite_existing_final_path(tmp_path: Path) -> None:
     source = tmp_path / "source.mkv"
     final = tmp_path / "final.mkv"
     source.write_bytes(b"new content")
     final.write_bytes(b"existing content -- must not be touched")
 
     with pytest.raises(FileExistsError):
-        finalize_same_device_move(str(source), str(final))
+        finalize_same_filesystem_source_move(str(source), str(final))
 
     # Neither copy was touched by the failed attempt.
     assert source.read_bytes() == b"new content"
     assert final.read_bytes() == b"existing content -- must not be touched"
 
 
-def test_finalize_same_device_move_propagates_cross_device_link_failure_without_deleting_source(
+def test_finalize_same_filesystem_source_move_propagates_cross_device_link_failure_without_deleting_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Simulates a filesystem that doesn't support hard links (some
@@ -254,13 +259,13 @@ def test_finalize_same_device_move_propagates_cross_device_link_failure_without_
     monkeypatch.setattr(os, "link", _raise_exdev)
 
     with pytest.raises(OSError, match="simulated EXDEV"):
-        finalize_same_device_move(str(source), str(final))
+        finalize_same_filesystem_source_move(str(source), str(final))
 
     assert source.exists()
     assert not final.exists()
 
 
-def test_finalize_same_device_move_raises_and_preserves_both_on_inode_mismatch(
+def test_finalize_same_filesystem_source_move_raises_and_preserves_both_on_inode_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Simulates a filesystem that reports success from os.link() but
@@ -296,10 +301,208 @@ def test_finalize_same_device_move_raises_and_preserves_both_on_inode_mismatch(
     monkeypatch.setattr(os, "stat", _fake_stat)
 
     with pytest.raises(OSError, match="does not share an inode"):
-        finalize_same_device_move(str(source), str(final))
+        finalize_same_filesystem_source_move(str(source), str(final))
 
     assert source.exists()
     assert final.exists()
+
+
+# --- finalize_verified_temp_file (cross-filesystem, SMB-safe) ----------------------
+
+
+def test_finalize_verified_temp_file_promotes_temp_to_final(tmp_path: Path) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"payload")
+
+    finalize_verified_temp_file(str(temp), str(final))
+
+    assert not temp.exists()
+    assert final.read_bytes() == b"payload"
+
+
+def test_finalize_verified_temp_file_never_calls_os_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"payload")
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("finalize_verified_temp_file must never call os.link")
+
+    monkeypatch.setattr(os, "link", _forbidden)
+
+    finalize_verified_temp_file(str(temp), str(final))
+
+    assert not temp.exists()
+    assert final.read_bytes() == b"payload"
+
+
+def test_finalize_verified_temp_file_reproduces_smb_hard_link_failure_and_still_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the real production failure: os.link()
+    raising errno 45 (ENOTSUP) against an SMB-mounted NAS destination.
+    finalize_verified_temp_file must succeed anyway, because it never
+    calls os.link() in the first place."""
+    directory = tmp_path / "Movies" / "District 9 (2009)"
+    directory.mkdir(parents=True)
+    temp = directory / ".District 9 (2009).mkv.mams-partial-824e39f7512a248d5f4e57bf99326dfe"
+    final = directory / "District 9 (2009).mkv"
+    temp.write_bytes(b"payload")
+
+    def _raise_enotsup(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(os, "link", _raise_enotsup)
+
+    finalize_verified_temp_file(str(temp), str(final))
+
+    assert not temp.exists()
+    assert final.read_bytes() == b"payload"
+
+
+def test_finalize_verified_temp_file_refuses_to_overwrite_existing_final_path(tmp_path: Path) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"new content")
+    final.write_bytes(b"existing content -- must not be touched")
+
+    with pytest.raises(DestinationCollisionError):
+        finalize_verified_temp_file(str(temp), str(final))
+
+    assert temp.read_bytes() == b"new content"
+    assert final.read_bytes() == b"existing content -- must not be touched"
+
+
+def test_finalize_verified_temp_file_fallback_path_also_refuses_to_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forces the lock-protected fallback (simulating RENAME_EXCL being
+    unsupported, as it is on a real SMB mount) and proves it still never
+    overwrites an existing destination -- the collision here is only
+    detectable by the fallback's own lstat check, not by the precondition
+    check that runs before the primitive is even tried, because the
+    destination is created *between* those two checks."""
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"new content")
+
+    def _force_unsupported(*args: object, **kwargs: object) -> None:
+        final.write_bytes(b"existing content -- must not be touched")
+        raise fs_module._RenameExclUnsupportedError("simulated: RENAME_EXCL unsupported")
+
+    monkeypatch.setattr(fs_module, "_renamex_np_no_replace", _force_unsupported)
+
+    with pytest.raises(DestinationCollisionError):
+        finalize_verified_temp_file(str(temp), str(final))
+
+    assert temp.read_bytes() == b"new content"
+    assert final.read_bytes() == b"existing content -- must not be touched"
+
+
+def test_finalize_verified_temp_file_uses_fallback_when_renamex_np_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"payload")
+
+    def _raise_unsupported(*args: object, **kwargs: object) -> None:
+        raise fs_module._RenameExclUnsupportedError("simulated: RENAME_EXCL unsupported")
+
+    monkeypatch.setattr(fs_module, "_renamex_np_no_replace", _raise_unsupported)
+
+    finalize_verified_temp_file(str(temp), str(final))
+
+    assert not temp.exists()
+    assert final.read_bytes() == b"payload"
+
+
+def test_finalize_verified_temp_file_rejects_symlink_temp(tmp_path: Path) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    real_file = tmp_path / "elsewhere.mkv"
+    real_file.write_bytes(b"payload")
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    temp.symlink_to(real_file)
+    final = directory / "Alien (1979).mkv"
+
+    with pytest.raises(FinalizationPreconditionError, match="symlink"):
+        finalize_verified_temp_file(str(temp), str(final))
+
+    assert temp.is_symlink()
+    assert not final.exists()
+
+
+def test_finalize_verified_temp_file_rejects_symlink_destination(tmp_path: Path) -> None:
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere.mkv"
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    temp.write_bytes(b"payload")
+    final = directory / "Alien (1979).mkv"
+    final.symlink_to(elsewhere)
+
+    with pytest.raises(FinalizationPreconditionError, match="symlink"):
+        finalize_verified_temp_file(str(temp), str(final))
+
+    assert temp.exists()
+    assert final.is_symlink()
+
+
+def test_finalize_verified_temp_file_rejects_parent_directory_mismatch(tmp_path: Path) -> None:
+    temp_dir = tmp_path / "Incoming"
+    temp_dir.mkdir()
+    final_dir = tmp_path / "Movies" / "Alien (1979)"
+    final_dir.mkdir(parents=True)
+    temp = temp_dir / ".Alien (1979).mkv.mams-partial-tok"
+    temp.write_bytes(b"payload")
+    final = final_dir / "Alien (1979).mkv"
+
+    with pytest.raises(FinalizationPreconditionError, match="parent directory"):
+        finalize_verified_temp_file(str(temp), str(final))
+
+    assert temp.exists()
+    assert not final.exists()
+
+
+def test_finalize_verified_temp_file_attempts_directory_fsync_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fsync of the destination directory is attempted, but a platform
+    that doesn't support it must not fail the whole finalization --
+    directory-entry durability is best-effort."""
+    directory = tmp_path / "Movies" / "Alien (1979)"
+    directory.mkdir(parents=True)
+    temp = directory / ".Alien (1979).mkv.mams-partial-tok"
+    final = directory / "Alien (1979).mkv"
+    temp.write_bytes(b"payload")
+
+    real_fsync = os.fsync
+    fsync_calls: list[int] = []
+
+    def _tracking_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        raise OSError("simulated: fsync not supported on this filesystem")
+
+    monkeypatch.setattr(os, "fsync", _tracking_fsync)
+
+    finalize_verified_temp_file(str(temp), str(final))
+
+    assert len(fsync_calls) == 1
+    assert not temp.exists()
+    assert final.read_bytes() == b"payload"
+    monkeypatch.setattr(os, "fsync", real_fsync)
 
 
 # --- remove_source_file ------------------------------------------------------------
