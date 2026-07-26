@@ -25,8 +25,9 @@ from enum import StrEnum
 # Container names MediaInfo commonly reports, mapped to the file
 # extensions considered plausible for them. Not exhaustive -- an
 # unrecognized container is simply not checked (no false WARNING for a
-# container this table doesn't know about yet).
-_PLAUSIBLE_EXTENSIONS_BY_CONTAINER: dict[str, frozenset[str]] = {
+# container this table doesn't know about yet). Public: execution.py's
+# post-transfer destination verification reuses this same table.
+PLAUSIBLE_EXTENSIONS_BY_CONTAINER: dict[str, frozenset[str]] = {
     "Matroska": frozenset({".mkv"}),
     "MPEG-4": frozenset({".mp4", ".m4v"}),
     "QuickTime": frozenset({".mov", ".m4v"}),
@@ -158,7 +159,7 @@ def verify_media(data: VerificationInput) -> VerificationResult:
         )
     )
 
-    plausible_extensions = _PLAUSIBLE_EXTENSIONS_BY_CONTAINER.get(data.container or "")
+    plausible_extensions = PLAUSIBLE_EXTENSIONS_BY_CONTAINER.get(data.container or "")
     if plausible_extensions is not None:
         checks.append(
             VerificationCheck(
