@@ -282,6 +282,74 @@ def test_execute_plan_cross_filesystem_happy_path(
     assert all(step.status in ("SUCCEEDED", "SKIPPED") for step in result.steps)
 
 
+def test_execute_plan_cross_filesystem_succeeds_when_hard_links_are_unsupported_like_smb(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test reproducing the real Milestone 8 NAS acceptance
+    failure end to end: a local Incoming source, simulated different
+    source/destination device IDs (forcing the cross-filesystem
+    strategy), and os.link() raising errno 45 ENOTSUP exactly as the
+    real SMB-mounted NAS destination did against execution #1. Copy and
+    checksum must still succeed, finalization must succeed via the new
+    SMB-safe primitive (which never calls os.link()), the source must be
+    removed only after destination verification passes, and the plan
+    and execution must both reach their success states."""
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="District9.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+    original_bytes = source_path.read_bytes()
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+
+    def _raise_enotsup(*args: object, **kwargs: object) -> None:
+        raise OSError(45, "Operation not supported")
+
+    monkeypatch.setattr("os.link", _raise_enotsup)
+
+    result = execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    assert result.status == "SUCCEEDED"
+    assert result.transfer_strategy == "CROSS_FILESYSTEM_COPY_VERIFY_REMOVE"
+    assert result.recovery_status == "NONE"
+    assert result.source_checksum is not None
+    assert result.destination_checksum == result.source_checksum
+
+    destination_path = Path(result.destination_path)
+    assert destination_path.exists()
+    assert destination_path.read_bytes() == original_bytes
+    assert not source_path.exists()
+    assert result.source_removed_at is not None
+
+    leftover_temp_files = list(destination_path.parent.glob(f".{destination_path.name}.mams-partial-*"))
+    assert leftover_temp_files == []
+
+    plan_after = get_plan(connection, plan_id)
+    assert plan_after is not None
+    assert plan_after.status == "EXECUTED"
+
+    step_types_and_status = [(step.step_type, step.status) for step in result.steps]
+    assert step_types_and_status == [
+        ("VALIDATE_SOURCE", "SUCCEEDED"),
+        ("CREATE_DESTINATION_DIRECTORY", "SUCCEEDED"),
+        ("STREAM_COPY_WITH_CHECKSUM", "SUCCEEDED"),
+        ("COMPUTE_DESTINATION_CHECKSUM", "SUCCEEDED"),
+        ("VERIFY_CHECKSUM_MATCH", "SUCCEEDED"),
+        ("FINAL_RENAME", "SUCCEEDED"),
+        ("VERIFY_DESTINATION_MEDIA", "SUCCEEDED"),
+        ("REMOVE_SOURCE", "SUCCEEDED"),
+        ("REFRESH_INVENTORY", "SUCCEEDED"),
+        ("PLEX_REFRESH", "SKIPPED"),
+        ("FINALIZE", "SUCCEEDED"),
+    ]
+
+
 def test_execute_plan_rejects_unknown_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
     config = _config(tmp_path)
     with pytest.raises(PlanNotFoundError):
@@ -421,10 +489,11 @@ def test_fault_injection_at_every_boundary_produces_the_documented_outcome(
 
     destination_path = Path(result.destination_path)
     if expected_recovery_status in ("NONE", "PARTIAL_DESTINATION_SOURCE_INTACT"):
-        # finalize_same_device_move only ever unlinks the source as its
-        # unguarded last line, after every prior check passed -- so the
-        # source is guaranteed intact for every fault point up to and
-        # including a failure inside the rename/commit step itself.
+        # finalize_same_filesystem_source_move/finalize_verified_temp_file
+        # only ever remove the source/temp as their unguarded last step,
+        # after every prior check passed -- so the source is guaranteed
+        # intact for every fault point up to and including a failure
+        # inside the rename/commit step itself.
         assert source_path.exists()
         assert source_path.read_bytes() == original_bytes
     elif expected_recovery_status == "DESTINATION_VERIFIED_SOURCE_NOT_REMOVED":

@@ -580,7 +580,7 @@ class _ExecutionRun:
         step = self._begin(3)
         try:
             self.injector.maybe_fail(FaultPoint.BEFORE_FINAL_RENAME)
-            fs.finalize_same_device_move(plan.source_path, destination_path)
+            fs.finalize_same_filesystem_source_move(plan.source_path, destination_path)
             self.injector.maybe_fail(FaultPoint.AFTER_FINAL_RENAME)
         except Exception as exc:  # noqa: BLE001
             return self._fail(step_id=step.id, step_type="ATOMIC_RENAME", error=exc, recovery_status="PARTIAL_DESTINATION_SOURCE_INTACT")
@@ -710,7 +710,7 @@ class _ExecutionRun:
         step = self._begin(6)
         try:
             self.injector.maybe_fail(FaultPoint.BEFORE_FINAL_RENAME)
-            fs.finalize_same_device_move(str(temp_path), destination_path)
+            fs.finalize_verified_temp_file(str(temp_path), destination_path)
             self.injector.maybe_fail(FaultPoint.AFTER_FINAL_RENAME)
         except Exception as exc:  # noqa: BLE001
             return self._fail(step_id=step.id, step_type="FINAL_RENAME", error=exc, recovery_status="PARTIAL_DESTINATION_SOURCE_INTACT")
