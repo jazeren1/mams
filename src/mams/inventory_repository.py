@@ -390,13 +390,25 @@ def _record_change(
     change_type: str,
     absolute_path: str,
     changes: list[dict[str, object]] | None = None,
+    previous_absolute_path: str | None = None,
 ) -> None:
     connection.execute(
         """
-        INSERT INTO scan_changes (scan_run_id, media_file_id, library_id, change_type, absolute_path, details_json)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO scan_changes (
+            scan_run_id, media_file_id, library_id, change_type, absolute_path,
+            previous_absolute_path, details_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (scan_run_id, media_file_id, library_id, change_type, absolute_path, _serialize_details(changes or [])),
+        (
+            scan_run_id,
+            media_file_id,
+            library_id,
+            change_type,
+            absolute_path,
+            previous_absolute_path,
+            _serialize_details(changes or []),
+        ),
     )
 
 
@@ -481,6 +493,104 @@ def _reconcile_file(
             absolute_path=scanned_file.absolute_path,
             changes=changes,
         )
+
+
+def relocate_media_file(
+    connection: sqlite3.Connection,
+    *,
+    media_file_id: int,
+    new_library_id: int,
+    new_absolute_path: str,
+    new_relative_path: str,
+    new_filename: str,
+    new_extension: str,
+    new_parent_directory: str,
+    new_layout: str,
+    new_size_bytes: int,
+    new_mtime: float,
+    scan_run_id: int,
+    media_info: MediaInfo | None,
+    media_info_error: str | None,
+) -> None:
+    """Targeted, single-file canonical-inventory update for a file the
+    Milestone 8 executor has just moved/copied to a new destination --
+    deliberately not a category walk (contrast `scan_category`/
+    `persist_category_scan`, whose smallest granularity is an entire
+    category root). Never re-walks a directory; the caller has already
+    obtained every fact passed here (size/mtime via
+    `execution_filesystem.py`'s stat calls, `media_info` via a fresh
+    MediaInfo probe of the destination) -- like every other repository
+    function, this one performs no filesystem access itself.
+
+    Preserves the file's existing `media_files.id` and
+    `first_seen_scan_id`, so every row that already references this
+    file (an ingest plan, an identity assignment, a finding) keeps
+    describing the same logical file, uninterrupted by the move.
+    Deliberately not modeled as MISSING(old path) + ADDED(new path) --
+    that would sever every one of those references from what is still,
+    physically, the same file.
+
+    Records exactly one immutable `scan_changes` `'UPDATED'` event, with
+    `previous_absolute_path` populated -- a column this schema has
+    carried, unused, since `0003_scan_changes.sql`. Not itself
+    transactional -- callers run this inside `with connection:`
+    alongside the accompanying execution-state writes.
+    """
+    before_row = connection.execute("SELECT * FROM media_files WHERE id = ?", (media_file_id,)).fetchone()
+    if before_row is None:
+        raise ValueError(f"No media_files row with id {media_file_id}")
+    previous_absolute_path = before_row["absolute_path"]
+
+    before_tracks = None
+    if media_info is not None:
+        before_tracks = _fetch_before_tracks(connection, media_file_id)
+
+    connection.execute(
+        """
+        UPDATE media_files
+        SET library_id = ?, absolute_path = ?, relative_path = ?, filename = ?, extension = ?,
+            parent_directory = ?, layout = ?, size_bytes = ?, mtime = ?,
+            state = 'ACTIVE', missing_since_scan_id = NULL,
+            last_seen_scan_id = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            new_library_id,
+            new_absolute_path,
+            new_relative_path,
+            new_filename,
+            new_extension,
+            new_parent_directory,
+            new_layout,
+            new_size_bytes,
+            new_mtime,
+            scan_run_id,
+            media_file_id,
+        ),
+    )
+
+    if media_info is not None:
+        _update_media_info_success(connection, media_file_id, media_info)
+        _replace_tracks(connection, media_file_id, media_info)
+    elif media_info_error is not None:
+        _update_media_info_failure(connection, media_file_id, media_info_error)
+
+    after_row = connection.execute("SELECT * FROM media_files WHERE id = ?", (media_file_id,)).fetchone()
+    changes = _field_changes(before_row, after_row)
+    if before_tracks is not None and media_info is not None:
+        changes.extend(_track_changes(*before_tracks, media_info))
+    changes.append({"field": "absolute_path", "old": previous_absolute_path, "new": new_absolute_path})
+
+    _record_change(
+        connection,
+        scan_run_id=scan_run_id,
+        media_file_id=media_file_id,
+        library_id=new_library_id,
+        change_type="UPDATED",
+        absolute_path=new_absolute_path,
+        changes=changes,
+        previous_absolute_path=previous_absolute_path,
+    )
 
 
 def persist_category_scan(
