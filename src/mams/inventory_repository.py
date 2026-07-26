@@ -126,14 +126,22 @@ def start_scan_run(
     metadata_enabled: bool,
     mediainfo_version: str | None,
     triggered_by: str = "SCAN",
+    scan_scope: str = "FULL",
+    scope_category: str | None = None,
 ) -> int:
     """`triggered_by='EXECUTION'` tags a scan_runs row created by the
     Milestone 8 executor's targeted single-file inventory refresh
     (`relocate_media_file`), distinguishing it from a real directory-walk
-    scan in scan history -- see `0014_ingest_executions.sql`."""
+    scan in scan history -- see `0014_ingest_executions.sql`.
+
+    `scan_scope='CATEGORY'` with `scope_category` set tags a Milestone 8.2
+    `--category` scoped scan, distinguishing it from a full multi-category
+    scan (`scan_scope='FULL'`, the default) -- see `0015_scan_scope.sql`.
+    """
     cursor = connection.execute(
-        "INSERT INTO scan_runs (metadata_enabled, mediainfo_version, triggered_by) VALUES (?, ?, ?)",
-        (int(metadata_enabled), mediainfo_version, triggered_by),
+        "INSERT INTO scan_runs (metadata_enabled, mediainfo_version, triggered_by, scan_scope, scope_category) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (int(metadata_enabled), mediainfo_version, triggered_by, scan_scope, scope_category),
     )
     return _lastrowid(cursor)
 
@@ -668,8 +676,18 @@ def persist_scan(
     *,
     metadata_enabled: bool,
     mediainfo_version: str | None,
+    scan_scope: str = "FULL",
+    scope_category: str | None = None,
 ) -> int:
     """Persist one `mams inventory scan` result. Returns the scan_runs id.
+
+    `categories` (and `report`) drive both discovery and reconciliation
+    scope: a category absent from `categories` is never synced, never
+    reconciled, and never has its files marked MISSING (see
+    `mark_missing_files`, called only per entry in `report.categories`
+    below). A Milestone 8.2 `--category` scoped scan simply passes a
+    single-entry `categories`/`report` -- no separate scoped code path
+    exists here.
 
     See the module docstring for the two-phase commit/rollback strategy.
     Re-raises whatever exception caused a failure, after recording it on
@@ -678,7 +696,11 @@ def persist_scan(
     with connection:
         library_ids = sync_libraries(connection, categories)
         scan_run_id = start_scan_run(
-            connection, metadata_enabled=metadata_enabled, mediainfo_version=mediainfo_version
+            connection,
+            metadata_enabled=metadata_enabled,
+            mediainfo_version=mediainfo_version,
+            scan_scope=scan_scope,
+            scope_category=scope_category,
         )
 
     try:
@@ -950,6 +972,8 @@ class ScanRunRecord:
     missing_count: int | None
     restored_count: int | None
     error_message: str | None
+    scan_scope: str
+    scope_category: str | None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1127,6 +1151,8 @@ def _row_to_scan_run_record(row: sqlite3.Row) -> ScanRunRecord:
         missing_count=row["missing_count"],
         restored_count=row["restored_count"],
         error_message=row["error_message"],
+        scan_scope=row["scan_scope"],
+        scope_category=row["scope_category"],
     )
 
 
