@@ -219,6 +219,64 @@ def test_execute_plan_same_filesystem_happy_path(connection: sqlite3.Connection,
     assert result.plex_refresh_status == "SKIPPED"
 
 
+def test_execute_plan_cross_filesystem_happy_path(
+    connection: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forces the cross-filesystem strategy by monkeypatching
+    stat_device_id -- tmp_path is a single real filesystem, so this is
+    the only way to exercise the copy/checksum/commit/remove path in a
+    fast, hermetic unit test without a second real mounted volume."""
+    import mams.execution_filesystem as fs_module
+
+    config = _config(tmp_path)
+    plan_id = _build_ready_approved_plan(connection, tmp_path, config, name="Alien2.mkv")
+    plan = get_plan(connection, plan_id)
+    assert plan is not None
+    source_path = Path(plan.source_path)
+    original_bytes = source_path.read_bytes()
+
+    def _fake_stat_device_id(path: str) -> int:
+        return 1 if path == str(source_path) else 2
+
+    monkeypatch.setattr(fs_module, "stat_device_id", _fake_stat_device_id)
+
+    result = execute_plan(connection, config, plan_id=plan_id, metadata_provider=_FakeMetadataProvider())
+
+    assert result.status == "SUCCEEDED"
+    assert result.transfer_strategy == "CROSS_FILESYSTEM_COPY_VERIFY_REMOVE"
+    assert result.recovery_status == "NONE"
+    assert result.source_checksum is not None
+    assert result.destination_checksum == result.source_checksum
+
+    destination_path = Path(result.destination_path)
+    assert destination_path.exists()
+    assert destination_path.read_bytes() == original_bytes
+    assert not source_path.exists()
+
+    leftover_temp_files = list(destination_path.parent.glob(f".{destination_path.name}.mams-partial-*"))
+    assert leftover_temp_files == []
+
+    plan_after = get_plan(connection, plan_id)
+    assert plan_after is not None
+    assert plan_after.status == "EXECUTED"
+
+    step_types = [step.step_type for step in result.steps]
+    assert step_types == [
+        "VALIDATE_SOURCE",
+        "CREATE_DESTINATION_DIRECTORY",
+        "STREAM_COPY_WITH_CHECKSUM",
+        "COMPUTE_DESTINATION_CHECKSUM",
+        "VERIFY_CHECKSUM_MATCH",
+        "FINAL_RENAME",
+        "VERIFY_DESTINATION_MEDIA",
+        "REMOVE_SOURCE",
+        "REFRESH_INVENTORY",
+        "PLEX_REFRESH",
+        "FINALIZE",
+    ]
+    assert all(step.status in ("SUCCEEDED", "SKIPPED") for step in result.steps)
+
+
 def test_execute_plan_rejects_unknown_plan(connection: sqlite3.Connection, tmp_path: Path) -> None:
     config = _config(tmp_path)
     with pytest.raises(PlanNotFoundError):
