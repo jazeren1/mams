@@ -76,3 +76,46 @@ Milestone 8 executor is expected to require `READY_FOR_EXECUTOR` from
 this audit immediately before acting on a plan, but no executor exists
 anywhere in this codebase yet, and this milestone still moves, copies,
 renames, deletes, or replaces nothing, and never requests a Plex scan.
+
+## Milestone 8: safe approved-plan execution
+
+Milestone 8 implements the "Safe Copy or Replacement" stage — the first
+code in this repository that mutates the filesystem at all. `mams
+ingest execute PLAN_ID --confirm-plan PLAN_ID` moves exactly one
+`APPROVED`, `READY_FOR_EXECUTOR` plan's file from Incoming to its
+canonical NAS destination, one plan at a time, only on explicit
+operator confirmation. See `docs/EXECUTION-SAFETY.md` for the full
+state machine, locking strategy, transfer strategies, checksum policy,
+and recovery scenarios.
+
+The primary safety principle: no plan action is trusted merely because
+it was approved earlier, or even because the readiness audit passed a
+moment ago. The audit is re-run fresh immediately before acquiring the
+execution lock, and — after the lock is held — live filesystem
+evidence (fresh `stat()`s, device IDs, free space) is gathered and
+checked again (`execution.evaluate_preflight()`) before any mutation
+begins.
+
+Two transfer strategies, decided from live device IDs rather than a
+path heuristic: `SAME_FILESYSTEM_ATOMIC_RENAME` (an `os.link` +
+`os.unlink` hard-link move — atomic and inherently no-clobber, since
+`os.link()` raises natively if the destination exists) and
+`CROSS_FILESYSTEM_COPY_VERIFY_REMOVE` (stream copy with an
+incrementally-computed checksum, an independent re-read checksum of
+the written file, an atomic commit using the same no-clobber
+hard-link primitive, fresh destination verification, and only then
+source removal). No destination is ever overwritten; a failure at any
+point leaves duplicate or partial evidence on disk rather than
+guessing and deleting something that might be the only good copy.
+
+Canonical inventory is refreshed for the one file that moved
+(`inventory_repository.relocate_media_file()`), never by re-walking an
+entire NAS category — the moved file keeps its existing `media_files`
+row and id, so every plan/assignment/finding that already references it
+stays correctly linked across the move. Plex refresh stays disabled by
+default (`execution.enable_plex_refresh: false`); no Plex client exists
+in this codebase, so the step always records `SKIPPED`.
+
+There is no automatic retry: a failed or `RECOVERY_REQUIRED` execution
+requires an operator to inspect (`mams ingest recovery EXECUTION_ID`,
+strictly read-only) and generate a fresh plan for another attempt.

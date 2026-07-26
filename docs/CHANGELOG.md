@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.8.0
+
+Added Milestone 8: safe, one-plan-at-a-time approved-plan execution --
+the first code in this repository that mutates the filesystem. Full
+safety model in `docs/EXECUTION-SAFETY.md`.
+
+`mams ingest execute PLAN_ID --confirm-plan PLAN_ID` re-runs the
+Milestone 7C readiness audit fresh (never trusting an earlier result),
+acquires a database (`ingest_plans.status` `APPROVED` -> `EXECUTING`,
+guarded by the UPDATE's own `WHERE status = 'APPROVED'` clause rather
+than a prior SELECT) and filesystem lock
+(`execution.state_directory`/ingest-plan-N.lock`, atomic
+`O_CREAT|O_EXCL` create), then -- only after the lock is held --
+re-gathers live filesystem evidence a second time
+(`execution.evaluate_preflight()`, 20 checks) before any mutation
+begins. Without an exact `--confirm-plan` match, the command only
+prints a preview and performs no mutation.
+
+Two transfer strategies, decided from live `os.stat().st_dev` values,
+never a path heuristic: `SAME_FILESYSTEM_ATOMIC_RENAME` (an
+`os.link()`+`os.unlink()` hard-link move -- atomic and inherently
+no-clobber, since `os.link()` raises `FileExistsError` natively rather
+than silently overwriting the way `os.rename()` would) and
+`CROSS_FILESYSTEM_COPY_VERIFY_REMOVE` (streamed copy with an
+incrementally-computed SHA-256, an independent re-read checksum of the
+written temp file, an atomic commit using the same no-clobber
+hard-link primitive, fresh destination verification, and only then
+source removal). `execution_filesystem.py` never uses `shutil.copy`/
+`shutil.move` as a black box, and never deletes a partial temp file on
+failure -- a partial copy is retained as recovery evidence, never
+resumed or cleaned up automatically.
+
+A fresh MediaInfo probe runs against the destination file after
+transfer (`execution.verify_destination()`, 12 checks) -- never the
+plan-time snapshot, which only describes the source before it moved.
+Canonical inventory is refreshed for just the one file that moved
+(`inventory_repository.relocate_media_file()`, a new targeted,
+single-file reconciliation that keeps the file's existing
+`media_files` id rather than walking an entire NAS category root or
+modeling the move as MISSING+ADDED), recording one `scan_changes`
+`'UPDATED'` event with `previous_absolute_path` populated -- a column
+this schema has carried, unused, since `0003_scan_changes.sql`. Plex
+refresh stays disabled by default (`execution.enable_plex_refresh:
+false`); no Plex client exists in this codebase, so the step always
+records `SKIPPED` regardless.
+
+A mid-execution failure is never re-raised -- it is a fully recorded,
+legitimate outcome (`RECOVERY_REQUIRED` or `EXECUTION_FAILED`, with an
+exact `recovery_status` describing what's safe to assume about the
+source and destination), returned normally just like a `BLOCKED` plan
+already was. `mams ingest recovery EXECUTION_ID` is strictly read-only
+guidance for exactly that scenario; there is no `ingest retry` command
+in this milestone -- a failed execution requires generating a fresh
+plan, never reusing a stale one.
+
+`mams ingest executions`/`ingest execution EXECUTION_ID` add read-only
+browsing over the new execution history; `ingest audit` now also shows
+a plan's most recent execution alongside its readiness result.
+
+Two new migrations: `0013_ingest_plans_execution_statuses.sql` (widens
+`ingest_plans.status` via a 12-step table rebuild -- SQLite has no
+`ALTER TABLE ALTER COLUMN` -- rather than dropping the `CHECK`
+constraint) and `0014_ingest_executions.sql` (`ingest_executions`,
+`ingest_execution_steps`, and `scan_runs.triggered_by`).
+
+New safety test (`tests/test_safety_controlled_execution.py`) proves
+every rejection path in `ingest execute` itself -- an unapproved plan, a
+plan gone stale after approval, a missing or mismatched
+`--confirm-plan`, a lock already held, an unconfigured state directory
+-- produces zero filesystem mutation, using the same
+unconditional-raise monkeypatch technique as
+`tests/test_safety_no_execution.py` (left untouched: the read-only
+pre-execution workflow it covers is still true). A 13-point
+fault-injection suite (`tests/test_execution_service.py`) proves the
+exact recorded outcome at every named mutation boundary.
+
 ## 0.7.0
 
 Added Milestone 7C: live TMDb acceptance, an operator-controlled

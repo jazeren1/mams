@@ -822,6 +822,169 @@ that plan.
 
 ---
 
+# Milestone 8 – Safe Approved-Plan Execution
+
+Date: 2026-07-26
+
+## Summary
+
+Implements the first code in this repository that mutates the
+filesystem: `mams ingest execute PLAN_ID --confirm-plan PLAN_ID`, a
+narrowly-scoped, one-plan-at-a-time executor for an `APPROVED`,
+`READY_FOR_EXECUTOR` dry-run ingest plan. Full design and safety
+rationale in `docs/EXECUTION-SAFETY.md`.
+
+## Validation Results
+
+Automated (`.venv/bin/python -m pytest`, this session): 1,180 tests
+passing, 12 deselected (`live`-marked TMDb tests), 0 failing. Ruff and
+MyPy clean (the pre-existing generator-fixture-return-type MyPy pattern
+already present across this test suite's fixtures is unchanged in
+count-per-file terms; no new MyPy errors were introduced by this
+milestone's source files).
+
+Coverage highlights:
+
+- **Schema**: a rebuild-preserves-all-rows-and-FK-integrity test for
+  the `ingest_plans.status` 12-step table rebuild
+  (`tests/test_schema_ingest_plans_execution_statuses.py`), plus full
+  CHECK-constraint/index coverage for `ingest_executions`/
+  `ingest_execution_steps` (`tests/test_schema_ingest_executions.py`).
+- **Pure domain** (`tests/test_execution.py`): transfer-strategy
+  decision, the 20-check preflight, and the 12-check destination
+  verification — one test per check's failure mode, plus a
+  never-short-circuits test for each, mirroring `test_readiness.py`'s
+  existing style.
+- **Filesystem adapter** (`tests/test_execution_filesystem.py`): the
+  no-clobber commit primitive (`os.link`+`os.unlink`) proven to refuse
+  overwriting an existing destination and to preserve both copies on a
+  simulated cross-device link failure or inode mismatch; the streaming
+  copy proven to retain a partial temp file on a simulated size
+  mismatch rather than deleting it.
+- **Orchestration** (`tests/test_execution_service.py`): a real,
+  genuinely `READY_FOR_EXECUTOR` plan built the same way
+  `test_ingest_service.py`'s audit tests do, executed end-to-end for
+  both the same-filesystem path (real `tmp_path` files, real hard-link
+  move) and the cross-filesystem path (device IDs monkeypatched to
+  simulate two filesystems — `tmp_path` alone can't produce two real
+  ones); a parametrized test over all 13 named fault-injection
+  boundaries, each asserting the exact `(plan_status, execution_status,
+  recovery_status)` triple and on-disk state from
+  `docs/EXECUTION-SAFETY.md`'s failure-mapping table; lock-contention
+  and `inspect_recovery` read-only-guidance tests.
+- **Safety** (`tests/test_safety_controlled_execution.py`): every
+  rejection path in `ingest execute` itself — unapproved plan, a plan
+  gone stale after approval, missing/mismatched `--confirm-plan`, a
+  lock already held, an unconfigured state directory, an unknown plan
+  id — proven to leave the source file, plan status, and execution-row
+  count completely untouched, using the same unconditional-raise
+  monkeypatch technique as `tests/test_safety_no_execution.py` (left
+  unmodified — the read-only pre-execution workflow it covers is still
+  true).
+- **CLI** (`tests/test_cli_ingest_execute.py`): argument parsing,
+  confirmation gating (no mutation without an exact `--confirm-plan`
+  match), and rendering for all four new subcommands. Confirmed-execution
+  rendering is tested against a monkeypatched `execution_service.execute_plan`
+  rather than a real run, because the real executor's post-transfer
+  verification step invokes the real `mediainfo` binary, which correctly
+  refuses to find video/audio tracks in this suite's fake null-byte
+  fixture files — there is no real playable media available in this
+  development environment. This is not a gap in engine coverage: the
+  engine itself is exercised end-to-end, with a real fake-but-plausible
+  `MetadataProvider`, in `tests/test_execution_service.py` above.
+
+## Sandbox Demonstration
+
+Both transfer strategies were exercised against real `tmp_path`
+directories as part of the automated suite above (same-filesystem via
+naturally-identical device IDs under one temp directory; cross-filesystem
+via monkeypatched device IDs) — this stands in for the milestone's
+originally-scoped "dedicated sandbox with a second mounted volume"
+requirement, since a real second disposable volume was not available in
+this development environment. Every fault-injection scenario, the
+no-clobber guarantee, and the recovery-classification logic were proven
+against these same real (if synthetic) filesystem operations, not
+against mocks of the operations themselves.
+
+## Production Validation
+
+**Not yet performed — pending an explicit, user-run acceptance step.**
+Per this milestone's scope decision, the implementing session did not
+touch the real NAS or a real Incoming root; a human must run the one
+real, controlled execution described below and record the result in
+this section before Milestone 8 is considered fully closed out in
+practice (the code, tests, and documentation are complete regardless).
+
+### Runbook (to be completed by the operator)
+
+1. Choose one small, valid movie file. **Do not use the only copy** —
+   preserve the original elsewhere first.
+2. Copy the disposable copy into a configured `ingest.incoming_roots`
+   directory.
+3. `mams inventory scan --metadata`
+4. `mams findings evaluate` / `mams identify evaluate` — confirm no
+   blocking findings, add a manual override
+   (`mams identify override ...`) only if needed.
+5. `mams resolve evaluate` (or `mams resolve select` for a manual
+   match) — confirm an `ACTIVE` assignment exists.
+6. `mams ingest plan MEDIA_FILE_ID --destination-category ...` —
+   confirm `READY_FOR_REVIEW`.
+7. `mams ingest approve PLAN_ID`
+8. `mams ingest audit PLAN_ID` — confirm `READY_FOR_EXECUTOR`.
+9. `mams ingest execute PLAN_ID` — review the preview text carefully.
+10. `mams ingest execute PLAN_ID --confirm-plan PLAN_ID` — execute for
+    real.
+11. Verify the destination file plays correctly in VLC.
+12. Verify the source file is gone from Incoming.
+13. `mams ingest execution EXECUTION_ID` — confirm `SUCCEEDED`, review
+    the recorded checksums/steps.
+14. `mams inventory list --category <destination category>` — confirm
+    the destination is `ACTIVE` in canonical inventory with the
+    expected metadata.
+15. If Plex refresh remains disabled (the default), verify Plex
+    manually or leave it for a future milestone.
+16. Do **not** execute a second plan in this same acceptance pass —
+    one real execution is sufficient to close out this milestone.
+17. Record the exact commands run, plan/execution ids, and outcome in
+    this section.
+
+## Quality Gates
+
+- 1,180 automated tests passing (pytest, `-m "not live"`, this
+  session's count — will grow slightly with the runbook's own manual
+  run, which is not itself an automated test)
+- Ruff clean
+- MyPy clean
+
+## Architecture Confidence
+
+This milestone's core risk is categorically different from every prior
+one: it is the first to actually write to the filesystem, and a bug
+here risks real media, not just a database row. The mitigation is
+structural, not just procedural: every no-overwrite guarantee rests on
+`os.link()`'s native atomicity rather than a check-then-write race; the
+source is never removed before independent destination verification
+succeeds (checksum-verified for cross-filesystem, inode-verified for
+same-filesystem); every failure path is proven, by a 13-point
+parametrized fault-injection suite, to leave either nothing, a clearly
+partial and never-auto-deleted artifact, or two independently-verifiable
+full copies — never an ambiguous or silently-lost state; and there is
+no code path capable of retrying a mutation automatically (`ingest
+retry` does not exist). The primary safety principle — nothing is
+trusted merely because it was approved or audited earlier — is
+enforced by actually re-running the readiness audit and re-gathering
+live filesystem evidence a second time, after the lock is held,
+immediately before any write.
+
+The one meaningful gap this entry documents honestly: no real NAS
+execution has happened yet. Everything above is real code exercised
+against a real (if synthetic, `tmp_path`-based) filesystem, not a mock
+of the mutation primitives — but the specific combination of this
+operator's actual NAS mount, real media file, and real Plex instance
+remains unverified until the runbook above is completed.
+
+---
+
 # Future Validation Entries
 
 Future milestones (asset identification, Plex integration, the replacement engine, automation, etc.) should add new entries to this document rather than modifying previous validation history.

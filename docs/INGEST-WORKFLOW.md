@@ -1,10 +1,14 @@
 # Ingest Workflow (Operator Guide)
 
 This document walks the exact, current CLI workflow from a disposable file
-in `Incoming` through an execution-readiness audit. **No command described
-here executes a media action.** No filesystem executor exists anywhere in
-MAMS yet (that is Milestone 8's job) — every command below is either
-read-only or a database-only write.
+in `Incoming` through execution and canonical inventory reconciliation.
+Steps 1 through 11 are entirely read-only or database-only writes —
+**no command through the execution-readiness audit executes a media
+action.** Step 12, `mams ingest execute`, is the one command that
+mutates the filesystem, and only for one `APPROVED`,
+`READY_FOR_EXECUTOR` plan at a time, only with an exact
+`--confirm-plan` match. See `docs/EXECUTION-SAFETY.md` for its full
+safety model.
 
 All commands take `--config path/to/config.yaml` (defaults to
 `config/config.yaml`) and `--json` for machine-readable output.
@@ -236,11 +240,53 @@ accurate, actionable description of what should happen right now. It
 never regenerates a plan or re-resolves an identity by itself — it only
 reports.
 
-### 12. Stop — execution is not yet implemented
+### 12. Execute the plan
 
-There is no command past this point. No filesystem executor exists in
-MAMS; `readiness.py`'s audit is the contract a future Milestone 8
-executor is expected to require before acting on a plan.
+```
+mams ingest execute PLAN_ID
+```
+
+Without `--confirm-plan`, this only prints a preview (source,
+destination, best-effort transfer-strategy guess, current readiness
+status) and "NO ACTIONS WERE EXECUTED." — it performs no mutation.
+Execute for real:
+
+```
+mams ingest execute PLAN_ID --confirm-plan PLAN_ID
+```
+
+The exact match is required — a typo'd or omitted `--confirm-plan`
+always falls back to the preview. Immediately before doing anything,
+this re-runs the execution-readiness audit fresh (never trusting a
+prior result), acquires a database and filesystem lock for this plan,
+then re-gathers live filesystem evidence a second time and refuses to
+proceed if any of 20 preflight checks fail. Only then does it move the
+file — either an atomic hard-link move (same filesystem) or a
+copy/checksum/verify/remove sequence (cross filesystem) — verify the
+destination with a fresh MediaInfo probe, refresh canonical inventory
+for just that one file, and mark the plan `EXECUTED`. See
+`docs/EXECUTION-SAFETY.md` for the complete state machine and every
+failure/recovery scenario.
+
+```
+mams ingest executions [--plan-id] [--status] [--recovery-status] [--limit]
+mams ingest execution EXECUTION_ID
+```
+
+List execution history, or show one execution's full step-by-step
+record. Both read-only.
+
+```
+mams ingest recovery EXECUTION_ID
+```
+
+If an execution reports `FAILED` or `RECOVERY_REQUIRED`, this
+re-derives live evidence (does the source still exist? the
+destination? a partial temp file? is the lock still held?) and prints
+plain-English guidance. Strictly read-only — it never repairs or
+deletes anything; recovery requires an operator to look and decide.
+There is no `ingest retry` command: a failed execution requires
+generating a fresh plan, never reusing the stale one.
 
 ## Quick reference: status vocabulary
 
@@ -249,16 +295,26 @@ executor is expected to require before acting on a plan.
 | Identification source | `PARSED` / `MANUAL_OVERRIDE` | Which candidate resolution actually used (`mams identify show-effective`). |
 | Resolution attempt | `RESOLVED` / `REVIEW_REQUIRED` / `NO_MATCH` / `FAILED` / `SKIPPED` | Outcome of one TMDb search+score against one candidate. |
 | Assignment method | `AUTO` / `MANUAL` | How the current external identity was confirmed for a file. |
-| Plan status | `READY_FOR_REVIEW` / `REVIEW_REQUIRED` / `BLOCKED` / `APPROVED` / `SUPERSEDED` | Where a dry-run plan stands. |
-| Readiness status | `READY_FOR_EXECUTOR` / `STALE` / `BLOCKED` / `INCOMPLETE` | Whether an approved plan is still safe to hand to a future executor. |
+| Plan status | `READY_FOR_REVIEW` / `REVIEW_REQUIRED` / `BLOCKED` / `APPROVED` / `SUPERSEDED` / `EXECUTING` / `EXECUTED` / `EXECUTION_FAILED` / `RECOVERY_REQUIRED` | Where a plan stands, through and including execution. |
+| Readiness status | `READY_FOR_EXECUTOR` / `STALE` / `BLOCKED` / `INCOMPLETE` | Whether an approved plan is still safe to execute right now. |
+| Execution status | `EXECUTING` / `SUCCEEDED` / `FAILED` / `RECOVERY_REQUIRED` | One execution attempt's outcome. |
+| Recovery status | `NONE` / `PARTIAL_DESTINATION_SOURCE_INTACT` / `DESTINATION_VERIFIED_SOURCE_NOT_REMOVED` / `DESTINATION_UNVERIFIED_SOURCE_REMOVED` / `INVENTORY_REFRESH_INCOMPLETE` / `INTERRUPTED_STATE_UNKNOWN` / `OTHER_REQUIRES_MANUAL_INSPECTION` | What an operator needs to check after a non-`NONE` failure. |
 
 ## Safety guarantees, restated
 
-- No command in this workflow creates a directory, renames, moves,
-  copies, or deletes a file — anywhere, ever, in this version of MAMS.
-- No command requests a Plex scan.
-- Every proposed plan action is persisted `PROPOSED_NOT_EXECUTED`; no
-  code path can turn one into a real filesystem operation.
+- Steps 1 through 11 create no directory, rename, move, copy, or delete
+  no file — anywhere, ever. Step 12 is the sole exception, and only for
+  one plan at a time with an exact `--confirm-plan` match.
+- No destination is ever overwritten — enforced structurally (an atomic
+  exclusive-create primitive), not just by a pre-check.
+- The source file is removed only after the destination is copied,
+  checksummed, committed, and independently verified — never before.
+- No command requests a Plex scan unless `execution.enable_plex_refresh`
+  is explicitly enabled, and no Plex client exists in this codebase yet
+  regardless — the step always records `SKIPPED`.
+- Every proposed plan action is persisted `PROPOSED_NOT_EXECUTED` before
+  approval; execution's own step history is a separate, real record of
+  what was actually attempted.
 - `mams resolve provider-status`/`resolve evaluate` never print, log, or
   persist your TMDb token anywhere — not in output, not in the cache, not
   in an error message.

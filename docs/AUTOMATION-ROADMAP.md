@@ -15,6 +15,16 @@ FileBot-assisted matching, canonical names, episode mapping, ambiguity stops.
 ## Phase 4 — Copy and replacement
 Destination planning, old-file detection, temporary backup, copy, checksum, rollback, cleanup.
 
+**Implemented by Milestone 8** (`mams ingest execute`, see
+`docs/EXECUTION-SAFETY.md`): destination planning (Milestone 7B),
+same-filesystem atomic move and cross-filesystem copy-verify-remove,
+SHA-256 checksum verification, and a "prefer duplicate evidence over
+data loss" recovery model in place of automatic rollback (no
+`ingest retry` command; a failed execution requires a fresh plan).
+Old-file detection/replacement and temporary-backup staging are still
+out of scope — this milestone moves a file only to a destination that
+does not already exist; it never replaces an existing library file.
+
 ## Phase 5 — Plex integration
 Configure Plex, map libraries, request scans, poll for expected path.
 

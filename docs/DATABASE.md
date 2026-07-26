@@ -26,6 +26,10 @@ layers of tables:
   against TMDb, persists ranked scored matches and confirmed identity
   assignments, and generates structured dry-run ingest plans with
   proposed (never executed) actions. See "Milestone 7B" below.
+- **Execution history** (`ingest_executions`, `ingest_execution_steps`):
+  Milestone 8's approved-plan executor — one row per attempt to execute
+  an `APPROVED` plan, with an ordered, step-by-step record of what was
+  actually attempted. See "Milestone 8" below.
 
 Schema changes are versioned migrations under `database/migrations/`, never
 applied by hand to a deployed database. See "Migration strategy" below.
@@ -856,6 +860,188 @@ no other table (nothing else has a foreign key to `provider_cache`), so
 neither can affect `external_identities`, resolution attempts/
 assignments, or ingest plans.
 
+## Milestone 8: Safe Approved-Plan Execution
+
+Two migrations, `0013`-`0014`. This is the first milestone whose code
+mutates the filesystem at all — see `docs/EXECUTION-SAFETY.md` for the
+full safety model this schema supports.
+
+### `ingest_plans.status` widened (migration `0013`)
+
+`EXECUTING`, `EXECUTED`, `EXECUTION_FAILED`, and `RECOVERY_REQUIRED`
+are added to the existing status enum. SQLite has no `ALTER TABLE ...
+ALTER COLUMN`, so widening a `CHECK` constraint requires the standard
+12-step table rebuild (create `ingest_plans_new` with the wider
+`CHECK`, copy every row with its `id` preserved, drop the old table,
+rename the new one into place, recreate indexes) rather than dropping
+the constraint — this schema enforces every other status column at the
+database level, and this migration keeps that rigor rather than
+weakening it for the sake of a simpler migration. `ingest_plan_actions`
+needs no change at all: it references `ingest_plans(id)` by name, and
+the rebuild ends by renaming back to the identical table name — SQLite
+only rewrites another table's `REFERENCES` clause on a rename when the
+referenced table is renamed to a genuinely *different* name while
+something still points at the old one, which never happens here. A
+regression test runs `PRAGMA foreign_key_check` after the rebuild
+against seeded pre-migration data to prove this directly, rather than
+trusting the reasoning alone.
+
+### `ingest_executions`
+
+One row per attempt to execute an `APPROVED` plan.
+
+```sql
+CREATE TABLE ingest_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingest_plan_id INTEGER NOT NULL REFERENCES ingest_plans(id) ON DELETE CASCADE,
+    plan_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('EXECUTING','SUCCEEDED','FAILED','RECOVERY_REQUIRED')),
+    transfer_strategy TEXT CHECK (transfer_strategy IN
+        ('SAME_FILESYSTEM_ATOMIC_RENAME','CROSS_FILESYSTEM_COPY_VERIFY_REMOVE')),
+    source_path TEXT NOT NULL,
+    destination_path TEXT NOT NULL,
+    source_device_id INTEGER,
+    destination_device_id INTEGER,
+    checksum_algorithm TEXT NOT NULL DEFAULT 'sha256',
+    source_checksum TEXT,
+    destination_checksum TEXT,
+    source_size_bytes INTEGER NOT NULL,
+    destination_size_bytes INTEGER,
+    lock_token TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    failure_step TEXT,
+    failure_message TEXT,
+    recovery_status TEXT CHECK (recovery_status IN
+        ('NONE','PARTIAL_DESTINATION_SOURCE_INTACT','DESTINATION_VERIFIED_SOURCE_NOT_REMOVED',
+         'DESTINATION_UNVERIFIED_SOURCE_REMOVED','INVENTORY_REFRESH_INCOMPLETE',
+         'INTERRUPTED_STATE_UNKNOWN','OTHER_REQUIRES_MANUAL_INSPECTION')),
+    source_removed_at TEXT,
+    inventory_refresh_completed_at TEXT,
+    plex_refresh_status TEXT CHECK (plex_refresh_status IN ('SKIPPED','SUCCEEDED','FAILED')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Uniqueness/concurrency.** Not enforced by a partial unique index the
+way `ingest_plans`/`media_identity_assignments`/`identification_overrides`
+enforce "at most one current row" — instead, `ingest_plans.status`
+itself is the single source of truth: `transition_plan_to_executing()`'s
+`UPDATE ... WHERE status = 'APPROVED'` is the only way a plan reaches
+`EXECUTING`, and only a successful call to it is followed by an
+`ingest_executions` insert. A second concurrent attempt loses that race
+(`rowcount = 0`) before any row here is created, so a redundant index
+would only restate a guarantee the plan-status transition already
+provides.
+
+**Historical retention.** Rows are never deleted or overwritten in
+place — a `FAILED`/`RECOVERY_REQUIRED` execution is retained forever
+next to whatever attempt eventually succeeds for a regenerated plan,
+the same "evidence must outlive the moment" principle as
+`scan_changes`/`findings`/`resolution_attempts`. `ON DELETE CASCADE`
+from `ingest_plans` is the one exception to that general principle in
+this milestone: a plan row itself is never deleted by any code path
+today, so this only matters if a future milestone starts pruning plans,
+at which point its executions would need to go with it (there is no
+scenario where an execution outlives the plan it executed).
+
+**`source_checksum`/`destination_checksum`** are populated only for the
+cross-filesystem strategy; same-filesystem moves leave both `NULL` (see
+"Checksum policy" in `docs/EXECUTION-SAFETY.md` for why a hard-link
+move doesn't need one). **`recovery_status`** is `'NONE'` for a clean
+success or a failure before any mutation began, and one of the other
+values for a failure at or after a mutation began — see
+`docs/EXECUTION-SAFETY.md`'s failure-mapping table for the exact
+boundary-to-status mapping.
+
+### `ingest_execution_steps`
+
+An ordered, step-by-step record of what one execution actually
+attempted — the execution-time analogue of `ingest_plan_actions`, but a
+deliberately separate vocabulary (`step_type` here is not required to
+match `ingest_plan_actions.action_type`, since one table describes
+*proposed* actions and the other describes *actual attempted* steps).
+
+```sql
+CREATE TABLE ingest_execution_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingest_execution_id INTEGER NOT NULL REFERENCES ingest_executions(id) ON DELETE CASCADE,
+    step_order INTEGER NOT NULL CHECK (step_order >= 1),
+    step_type TEXT NOT NULL CHECK (step_type IN
+        ('VALIDATE_SOURCE','CREATE_DESTINATION_DIRECTORY','STREAM_COPY_WITH_CHECKSUM',
+         'COMPUTE_DESTINATION_CHECKSUM','VERIFY_CHECKSUM_MATCH','ATOMIC_RENAME','FINAL_RENAME',
+         'VERIFY_DESTINATION_MEDIA','REMOVE_SOURCE','REFRESH_INVENTORY','PLEX_REFRESH','FINALIZE')),
+    status TEXT NOT NULL CHECK (status IN ('PENDING','RUNNING','SUCCEEDED','FAILED','SKIPPED')),
+    started_at TEXT,
+    completed_at TEXT,
+    detail_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Steps are seeded `PENDING` (one row per planned step, in order) when
+the execution starts, then mutated in place through `RUNNING` to a
+terminal status — unlike `ingest_plan_actions` or `scan_changes`, there
+is no supersede/replace or append-only concept here: each row is
+exactly one real, currently-attempted step. A future retry (explicitly
+deferred, see `docs/EXECUTION-SAFETY.md`'s "Retry policy") would need a
+whole new `ingest_executions` row, never a new step row appended to an
+old one. `detail_json` follows the same
+`json.dumps(sort_keys=True, separators=(",", ":"))` convention as every
+other `*_json` column in this schema — evidence about the step (bytes
+copied, a computed checksum, a captured error message), never a
+duplicate of data that belongs somewhere else.
+
+### `scan_runs.triggered_by` (migration `0014`)
+
+One column added to the existing `scan_runs` table:
+
+```sql
+ALTER TABLE scan_runs ADD COLUMN triggered_by TEXT NOT NULL DEFAULT 'SCAN'
+    CHECK (triggered_by IN ('SCAN','EXECUTION'));
+```
+
+Distinguishes a real directory-walk scan (`mams inventory scan`) from
+the single-file targeted refresh the executor performs after a
+successful transfer (`inventory_repository.relocate_media_file()`,
+below) — without this, a `scan_runs` row with `file_count=1` would look
+like a suspiciously narrow real scan rather than what it actually is.
+
+### Targeted single-file inventory relocation (no new schema)
+
+`inventory_repository.relocate_media_file()` is the executor's only
+canonical-inventory write path, and it is deliberately **not** a
+category walk — it never calls `scan_category`/`persist_category_scan`,
+so a single rip never re-triggers a walk of an entire NAS category
+root. It updates the moved file's existing `media_files` row **by
+id** (not by a fresh `absolute_path` lookup, since the new path isn't
+in the table yet), preserving `first_seen_scan_id` and bumping
+`last_seen_scan_id`, so every row that already references this file
+(an `ingest_plans` row, a `media_identity_assignments` row, a
+`findings` row) keeps describing the same logical file, uninterrupted
+by the move. This is deliberately **not** modeled as the file going
+`MISSING` at its old path and a new file being `ADDED` at the new
+path — that would sever every one of those references from what is
+still, physically, the same file. It reuses the already-provisioned,
+previously-unused `scan_changes.previous_absolute_path` column (see
+"`scan_changes`" above) to record exactly one `'UPDATED'` event per
+relocation, with the file's prior path attached.
+
+### Execution-readiness preflight (`execution.py`, no new schema)
+
+Two more pure, read-only-input functions, mirroring
+`readiness.evaluate_readiness()`'s shape: `execution.evaluate_preflight()`
+(20 checks, run by `execution_service.execute_plan()` *after* the
+execution lock is acquired, against fresh `stat()`/`os.access()`
+evidence — the live revalidation `readiness.py`'s database-only audit
+cannot itself provide) and `execution.verify_destination()` (12 checks
+against a fresh post-transfer MediaInfo probe of the destination file,
+never the plan-time verification snapshot). Neither introduces a table;
+both feed directly into the `ingest_executions`/`ingest_execution_steps`
+rows described above. See `docs/EXECUTION-SAFETY.md` for the full
+check lists and the exact failure-to-recovery-status mapping.
+
 ## Primary keys
 
 `INTEGER AUTOINCREMENT` surrogates on all seven inventory tables. This
@@ -933,6 +1119,16 @@ identification milestone exists.
 - `resolution_attempts.identification_override_id → identification_overrides.id`
   (`ON DELETE SET NULL` — evidence must outlive its subject, same
   reasoning as `resolution_attempts.identification_candidate_id`)
+
+**Milestone 8 additions:**
+
+- `ingest_executions.ingest_plan_id → ingest_plans.id` (`ON DELETE
+  CASCADE` — no code path deletes a plan today; see "Milestone 8"
+  above for why this is the one exception to this schema's usual
+  "evidence must outlive its subject" default)
+- `ingest_execution_steps.ingest_execution_id → ingest_executions.id`
+  (`ON DELETE CASCADE` — owned child rows, same reasoning as
+  `ingest_plan_actions.ingest_plan_id`)
 
 ## Required indexes
 
@@ -1013,6 +1209,17 @@ CREATE UNIQUE INDEX idx_identification_overrides_active_media_file
     ON identification_overrides(media_file_id) WHERE cleared_at IS NULL;
 CREATE INDEX idx_identification_overrides_media_file_id ON identification_overrides(media_file_id);
 CREATE INDEX idx_resolution_attempts_override_id ON resolution_attempts(identification_override_id);
+
+-- Milestone 8 (database/migrations/0014) -- no partial unique index for
+-- "at most one active execution per plan": ingest_plans.status is
+-- itself the concurrency guard (see "ingest_executions" above).
+CREATE INDEX idx_ingest_executions_plan_id ON ingest_executions(ingest_plan_id);
+CREATE INDEX idx_ingest_executions_status ON ingest_executions(status);
+CREATE INDEX idx_ingest_executions_recovery_status ON ingest_executions(recovery_status);
+
+CREATE UNIQUE INDEX idx_ingest_execution_steps_execution_order
+    ON ingest_execution_steps(ingest_execution_id, step_order);
+CREATE INDEX idx_ingest_execution_steps_execution_id ON ingest_execution_steps(ingest_execution_id);
 ```
 
 ## Migration strategy
@@ -1041,6 +1248,15 @@ Numbered, forward-only SQL files under `database/migrations/`:
   identification_override_id` (same narrow-window caveat as `0003`, below).
 - `0012_ingest_plan_source_snapshot.sql` — Milestone 7C: `ALTER TABLE
   ingest_plans ADD COLUMN source_size_bytes`/`source_mtime` (same caveat).
+- `0013_ingest_plans_execution_statuses.sql` — Milestone 8: widens
+  `ingest_plans.status` via the 12-step table-rebuild pattern (see
+  "Milestone 8" above) rather than an `ALTER TABLE ADD COLUMN` — the
+  first migration in this project to rebuild a table rather than only
+  create or extend one.
+- `0014_ingest_executions.sql` — Milestone 8: `ingest_executions`,
+  `ingest_execution_steps`, and their indexes, plus `ALTER TABLE
+  scan_runs ADD COLUMN triggered_by` (same narrow-window caveat as
+  `0003`/`0011`/`0012`).
 
 `schema_version` tracks the highest applied migration number. A migration
 runner applies any file numbered above the current version, in order,
@@ -1186,6 +1402,16 @@ above.
 - `mams identify show CANDIDATE_ID [--json]` — one candidate's full detail
   (type, confidence, parsed fields, evidence, parser version, timestamps).
   A non-existent id prints a clear error and mutates nothing.
+- `mams ingest execute PLAN_ID --confirm-plan PLAN_ID [--json]` —
+  Milestone 8's approved-plan executor. Without a matching
+  `--confirm-plan`, prints a preview and mutates nothing. See
+  `docs/EXECUTION-SAFETY.md` for the full safety model.
+- `mams ingest executions [--plan-id] [--status] [--recovery-status]
+  [--limit] [--json]` — read-only execution-history listing.
+- `mams ingest execution EXECUTION_ID [--json]` — one execution's full
+  step-by-step history. Read-only.
+- `mams ingest recovery EXECUTION_ID [--json]` — read-only recovery
+  guidance for one execution; never mutates the database or filesystem.
 
 ## Risks and tradeoffs
 
