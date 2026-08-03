@@ -11,9 +11,9 @@ import pytest
 from mams.config import AppConfig
 from mams.db import connect, migrate
 from mams.ingest_repository import PlanNotApprovableError, get_current_plan_for_media_file
-from mams.ingest_service import IngestPlanError, approve, audit_plan, generate_plan
+from mams.ingest_service import IngestPlanError, approve, audit_plan, confirm_identity, generate_plan
 from mams.readiness import ReadinessStatus
-from mams.resolution_repository import assign_identity, upsert_external_identity
+from mams.resolution_repository import assign_identity, get_active_assignment, upsert_external_identity
 
 REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "database" / "migrations"
 
@@ -679,3 +679,181 @@ def test_audit_deterministic_across_repeated_calls(connection: sqlite3.Connectio
     second = audit_plan(connection, config, plan_id=plan.id)
 
     assert first.to_dict() == second.to_dict()
+
+
+# --- manual identity confirmation for ingest (Milestone 8.3) --------------------
+
+
+def test_confirm_identity_does_not_change_plan_status_directly(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    """The confirm step is deliberately separate from replanning -- a
+    plan's status must never change merely because the assignment behind
+    it was confirmed; the operator must regenerate the plan."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "REVIEW_REQUIRED"
+
+    confirm_identity(connection, plan.id)
+
+    unchanged = get_current_plan_for_media_file(connection, media_file_id)
+    assert unchanged is not None
+    assert unchanged.status == "REVIEW_REQUIRED"
+    assert unchanged.id == plan.id
+
+
+def test_replan_after_confirm_identity_reaches_ready_for_review(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "REVIEW_REQUIRED"
+
+    confirm_identity(connection, plan.id)
+    replanned = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert replanned.id == plan.id  # same plan row, reconciled in place
+    assert replanned.status == "READY_FOR_REVIEW"
+
+
+def test_confirm_replan_approve_audit_reaches_ready_for_executor(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    """The full intended flow: resolve select (MANUAL) -> confirm-identity
+    -> replan -> approve -> audit READY_FOR_EXECUTOR, mirroring the
+    production plan 33 / assignment 91 scenario this fix addresses."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    confirm_identity(connection, plan.id)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "READY_FOR_REVIEW"
+
+    approved = approve(connection, plan.id)
+    assert approved.status == "APPROVED"
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+    assert result.readiness_status == ReadinessStatus.READY_FOR_EXECUTOR
+
+
+def test_confirm_identity_is_idempotent(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    first = confirm_identity(connection, plan.id)
+    second = confirm_identity(connection, plan.id)
+
+    assert first.confirmed_for_ingest_at == second.confirmed_for_ingest_at
+    assert second.confirmed_for_ingest_at is not None
+
+
+def test_confirm_identity_rejects_unknown_plan(connection: sqlite3.Connection) -> None:
+    with pytest.raises(IngestPlanError):
+        confirm_identity(connection, 999999)
+
+
+def test_confirm_identity_rejects_plan_with_no_assignment(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    _seed_candidate(connection, media_file_id=media_file_id)
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "BLOCKED"
+
+    with pytest.raises(IngestPlanError, match="no resolved identity assignment"):
+        confirm_identity(connection, plan.id)
+
+
+def test_confirm_identity_rejects_auto_assignment(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    """AUTO-resolved plans never need confirmation -- this must fail
+    clearly rather than silently succeeding as a no-op that could mask a
+    usage mistake."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="AUTO")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    assert plan.status == "READY_FOR_REVIEW"
+
+    with pytest.raises(IngestPlanError, match="AUTO"):
+        confirm_identity(connection, plan.id)
+
+
+def test_confirm_identity_rejects_stale_assignment_after_reselection(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A wrong or stale assignment must not be confirmable against the
+    current plan: if a later `resolve select`/`resolve evaluate`
+    superseded the assignment the plan was generated against, confirming
+    the plan's stale snapshot must fail and direct the operator to
+    regenerate the plan first."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    other_identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=679, title="Aliens", release_year=1986)
+    assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=other_identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+
+    with pytest.raises(IngestPlanError, match="regenerate the plan"):
+        confirm_identity(connection, plan.id)
+
+
+def test_confirm_identity_does_not_carry_to_replacement_assignment(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+    confirm_identity(connection, plan.id)
+
+    other_identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=679, title="Aliens", release_year=1986)
+    assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=other_identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+    replanned = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert replanned.status == "REVIEW_REQUIRED"
+    active = get_active_assignment(connection, media_file_id)
+    assert active is not None
+    assert active.confirmed_for_ingest_at is None
+
+
+def test_no_filesystem_writes_occur_during_confirm_identity(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    confirm_identity(connection, plan.id)
+
+    assert not (tmp_path / "NAS" / "Movies").exists()
+    assert (tmp_path / "Incoming" / "Alien.mkv").exists()
+
+
+def test_generate_plan_review_required_for_manual_assignment_stays_unconfirmed_by_default(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Regression guard: a fresh MANUAL assignment must still force
+    REVIEW_REQUIRED without an explicit confirm-identity call -- this is
+    the safety invariant the fix must not weaken."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id, method="MANUAL")
+    config = _config(tmp_path)
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "REVIEW_REQUIRED"
+    assert any("has not yet been confirmed for ingest" in r for r in plan.blocking_reasons)

@@ -5,8 +5,16 @@ This is the only module that combines `verification.py` and
 `destination.py` (both pure) with `inventory_repository.py`,
 `identification_repository.py`, `resolution_repository.py`, and
 `findings_repository.py` (read-only lookups) and `ingest_repository.py`
-(the only writer). Mirrors the role `resolution_service.py` plays for
+(the primary writer). Mirrors the role `resolution_service.py` plays for
 resolution.
+
+`confirm_identity()` (Milestone 8.3) is this module's one deliberate
+exception: it writes `media_identity_assignments.confirmed_for_ingest_at`/
+`confirmed_by` via `resolution_repository.confirm_assignment_for_ingest`
+rather than only reading `resolution_repository`, because "confirmed for
+ingest" is an ingest-domain fact whose single source of truth is the
+assignment row itself -- duplicating it onto `ingest_plans` would require
+re-deriving it on every regeneration instead of surviving one.
 
 This milestone never renames, moves, copies, deletes, replaces media, or
 creates a directory -- every proposed action this module writes is
@@ -211,7 +219,7 @@ def generate_plan(
         blocking_reasons.append("no local identification candidate exists for this file")
     if assignment is None or identity is None:
         blocking_reasons.append("no resolved ACTIVE external identity assignment exists for this file")
-    elif assignment.assignment_method == "MANUAL":
+    elif assignment.assignment_method == "MANUAL" and assignment.confirmed_for_ingest_at is None:
         review_reasons.append("identity was manually selected and has not yet been confirmed for ingest")
 
     error_count = len(findings_repository.list_findings(connection, media_file_id=media_file_id, status="ACTIVE", severity="ERROR"))
@@ -287,6 +295,55 @@ def approve(connection: sqlite3.Connection, plan_id: int) -> PlanRecord:
     anything else."""
     with connection:
         return approve_plan(connection, plan_id)
+
+
+def confirm_identity(connection: sqlite3.Connection, plan_id: int) -> AssignmentRecord:
+    """Explicitly confirm the manually selected identity behind plan_id
+    for ingest -- the operator action `docs/INGEST-WORKFLOW.md` documents
+    between `resolve select` and regenerating the plan. Does not itself
+    change `plan_id`'s status: the operator must re-run `mams ingest plan
+    MEDIA_FILE_ID ...` afterward so `generate_plan` recomputes and
+    reconciles the plan in place (the same discipline every other
+    blocking/review reason already follows -- "the audit reports state;
+    explicit commands perform changes").
+
+    Confirms only the exact assignment `plan_id` was generated against --
+    if the file's current ACTIVE assignment has since changed (a new
+    `resolve select`/`resolve evaluate` superseded it), this raises
+    `IngestPlanError` rather than silently confirming a different
+    identity than the one the operator reviewed on this plan; regenerate
+    the plan first. Raises `IngestPlanError` for an unknown plan, a plan
+    with no resolved assignment at all, or an assignment that doesn't
+    need/support confirmation (already AUTO-resolved, or no longer
+    ACTIVE) -- `resolution_repository.confirm_assignment_for_ingest`'s
+    own errors are re-raised as this module's usage-level exception so
+    every `mams ingest` CLI handler can catch one error type.
+
+    Writes only `media_identity_assignments.confirmed_for_ingest_at`/
+    `confirmed_by`, via `resolution_repository.confirm_assignment_for_ingest`
+    -- the one write this module makes outside `ingest_repository.py`,
+    because "confirmed for ingest" is recorded on the assignment row
+    (the concept's natural, single source of truth -- see
+    docs/DECISIONS.md) rather than duplicated onto the plan. No
+    filesystem access."""
+    plan = get_plan(connection, plan_id)
+    if plan is None:
+        raise IngestPlanError(f"No ingest plan with id {plan_id}")
+    if plan.media_identity_assignment_id is None:
+        raise IngestPlanError(f"Plan {plan_id} has no resolved identity assignment to confirm")
+
+    current_assignment = resolution_repository.get_active_assignment(connection, plan.media_file_id)
+    if current_assignment is None or current_assignment.id != plan.media_identity_assignment_id:
+        raise IngestPlanError(
+            f"Plan {plan_id}'s identity assignment is no longer the current one for media file "
+            f"{plan.media_file_id} -- regenerate the plan (mams ingest plan {plan.media_file_id} ...) before confirming"
+        )
+
+    with connection:
+        try:
+            return resolution_repository.confirm_assignment_for_ingest(connection, assignment_id=current_assignment.id)
+        except resolution_repository.AssignmentNotConfirmableError as exc:
+            raise IngestPlanError(str(exc)) from exc
 
 
 def _path_is_inside(path: str, root: str) -> bool:
