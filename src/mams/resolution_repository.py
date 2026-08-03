@@ -515,6 +515,8 @@ class AssignmentRecord:
     status: str
     created_at: str
     updated_at: str
+    confirmed_for_ingest_at: str | None
+    confirmed_by: str | None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -532,6 +534,8 @@ def _row_to_assignment(row: sqlite3.Row) -> AssignmentRecord:
         status=row["status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        confirmed_for_ingest_at=row["confirmed_for_ingest_at"],
+        confirmed_by=row["confirmed_by"],
     )
 
 
@@ -604,3 +608,44 @@ def revoke_assignment(connection: sqlite3.Connection, *, assignment_id: int) -> 
         (assignment_id,),
     )
     return get_assignment(connection, assignment_id)
+
+
+class AssignmentNotConfirmableError(Exception):
+    """Raised by confirm_assignment_for_ingest when the assignment doesn't
+    exist, is no longer ACTIVE (superseded/revoked), or wasn't manually
+    selected -- an AUTO assignment needs no ingest confirmation and can
+    never be passed here by a correct caller."""
+
+
+def confirm_assignment_for_ingest(
+    connection: sqlite3.Connection, *, assignment_id: int, confirmed_by: str = "MANUAL_CLI"
+) -> AssignmentRecord:
+    """Explicitly confirm one ACTIVE, MANUAL assignment as reviewed and
+    accepted for ingest -- the gate `ingest_service.generate_plan` checks
+    before a manually selected identity can reach READY_FOR_REVIEW.
+    Idempotent: confirming an already-confirmed assignment is a no-op that
+    returns it unchanged, never rewriting confirmed_for_ingest_at/
+    confirmed_by. A superseding `assign_identity` call always creates a
+    brand-new assignment row for a changed identity, so confirmation never
+    carries over to a replacement assignment by construction."""
+    assignment = get_assignment(connection, assignment_id)
+    if assignment is None:
+        raise AssignmentNotConfirmableError(f"No identity assignment with id {assignment_id}")
+    if assignment.status != "ACTIVE":
+        raise AssignmentNotConfirmableError(
+            f"Assignment {assignment_id} is {assignment.status}, not ACTIVE -- cannot confirm a superseded/revoked assignment"
+        )
+    if assignment.assignment_method != "MANUAL":
+        raise AssignmentNotConfirmableError(
+            f"Assignment {assignment_id} was resolved automatically (AUTO); ingest confirmation is not applicable"
+        )
+    if assignment.confirmed_for_ingest_at is not None:
+        return assignment
+    connection.execute(
+        "UPDATE media_identity_assignments SET confirmed_for_ingest_at = CURRENT_TIMESTAMP, confirmed_by = ?, "
+        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (confirmed_by, assignment_id),
+    )
+    updated = get_assignment(connection, assignment_id)
+    assert updated is not None
+    return updated

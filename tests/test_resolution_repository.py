@@ -12,8 +12,10 @@ import pytest
 
 from mams.db import connect, migrate
 from mams.resolution_repository import (
+    AssignmentNotConfirmableError,
     CandidateMatchInput,
     assign_identity,
+    confirm_assignment_for_ingest,
     get_active_assignment,
     get_attempt_stats,
     get_external_identity,
@@ -374,3 +376,89 @@ def test_revoke_assignment(connection: sqlite3.Connection, seeded: tuple[int, in
     assert revoked is not None
     assert revoked.status == "REVOKED"
     assert get_active_assignment(connection, media_file_id) is None
+
+
+# --- confirm_assignment_for_ingest -------------------------------------------------
+
+
+def _manual_assignment(connection: sqlite3.Connection, *, media_file_id: int, candidate_id: int) -> int:
+    identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=8077, title="Alien 3", release_year=1992)
+    assignment = assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+    return assignment.id
+
+
+def test_confirm_assignment_for_ingest_sets_confirmation(connection: sqlite3.Connection, seeded: tuple[int, int, int]) -> None:
+    _, media_file_id, candidate_id = seeded
+    assignment_id = _manual_assignment(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+
+    confirmed = confirm_assignment_for_ingest(connection, assignment_id=assignment_id)
+
+    assert confirmed.confirmed_for_ingest_at is not None
+    assert confirmed.confirmed_by == "MANUAL_CLI"
+
+
+def test_confirm_assignment_for_ingest_is_idempotent(connection: sqlite3.Connection, seeded: tuple[int, int, int]) -> None:
+    _, media_file_id, candidate_id = seeded
+    assignment_id = _manual_assignment(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+
+    first = confirm_assignment_for_ingest(connection, assignment_id=assignment_id)
+    second = confirm_assignment_for_ingest(connection, assignment_id=assignment_id)
+
+    assert first.confirmed_for_ingest_at == second.confirmed_for_ingest_at
+
+
+def test_confirm_assignment_for_ingest_rejects_auto_assignment(
+    connection: sqlite3.Connection, seeded: tuple[int, int, int]
+) -> None:
+    _, media_file_id, candidate_id = seeded
+    identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=348, title="Alien", release_year=1979)
+    assignment = assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=identity.id, resolution_attempt_id=None, assignment_method="AUTO", confidence="HIGH",
+    )
+
+    with pytest.raises(AssignmentNotConfirmableError, match="AUTO"):
+        confirm_assignment_for_ingest(connection, assignment_id=assignment.id)
+
+
+def test_confirm_assignment_for_ingest_rejects_superseded_assignment(
+    connection: sqlite3.Connection, seeded: tuple[int, int, int]
+) -> None:
+    _, media_file_id, candidate_id = seeded
+    stale_id = _manual_assignment(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    identity_2 = upsert_external_identity(connection, media_type="MOVIE", provider_id=999, title="Alien 3 Remake", release_year=1993)
+    assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=identity_2.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+
+    with pytest.raises(AssignmentNotConfirmableError, match="not ACTIVE"):
+        confirm_assignment_for_ingest(connection, assignment_id=stale_id)
+
+
+def test_confirm_assignment_for_ingest_rejects_unknown_id(connection: sqlite3.Connection) -> None:
+    with pytest.raises(AssignmentNotConfirmableError):
+        confirm_assignment_for_ingest(connection, assignment_id=999999)
+
+
+def test_confirm_assignment_for_ingest_does_not_carry_to_replacement_assignment(
+    connection: sqlite3.Connection, seeded: tuple[int, int, int]
+) -> None:
+    """Confirmation must apply only to the exact assignment row -- a new
+    manual selection (a new assignment row) must always start
+    unconfirmed, even if the prior assignment for the same file was
+    confirmed."""
+    _, media_file_id, candidate_id = seeded
+    first_id = _manual_assignment(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    confirm_assignment_for_ingest(connection, assignment_id=first_id)
+
+    identity_2 = upsert_external_identity(connection, media_type="MOVIE", provider_id=999, title="Alien 3 Remake", release_year=1993)
+    replacement = assign_identity(
+        connection, media_file_id=media_file_id, identification_candidate_id=candidate_id,
+        external_identity_id=identity_2.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+    )
+
+    assert replacement.confirmed_for_ingest_at is None

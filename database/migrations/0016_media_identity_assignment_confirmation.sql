@@ -1,0 +1,25 @@
+-- Explicit ingest-confirmation for manually selected identities
+-- (Milestone 8.3). `resolve select ATTEMPT_ID MATCH_ID` already confirms
+-- *which* external identity a file has (assignment_method='MANUAL'); this
+-- adds a second, independent fact -- whether an operator has explicitly
+-- accepted that manually selected identity *for ingest* -- so
+-- `ingest_service.generate_plan`'s existing "identity was manually
+-- selected and has not yet been confirmed for ingest" review reason has
+-- a code path that can ever clear it. See docs/DATABASE.md
+-- ("media_identity_assignments") and docs/ARCHITECTURE.md ("Milestone
+-- 8.3") for full rationale.
+--
+-- Both columns are nullable and unset by every historical row (AUTO or
+-- MANUAL, confirmed or not) -- this migration assigns no retroactive
+-- meaning to existing assignments. confirmed_by mirrors
+-- ingest_plans.approved_by's convention (a free-text operator/actor
+-- label, not a foreign key).
+--
+-- SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS form, so unlike
+-- the CREATE TABLE/INDEX statements elsewhere in this schema, this
+-- migration is not safely re-runnable if a crash lands between this
+-- script finishing and its schema_version row being recorded -- the same
+-- narrow, accepted caveat documented in 0003_scan_changes.sql,
+-- 0011_identification_overrides.sql, and 0015_scan_scope.sql.
+ALTER TABLE media_identity_assignments ADD COLUMN confirmed_for_ingest_at TEXT;
+ALTER TABLE media_identity_assignments ADD COLUMN confirmed_by TEXT;
