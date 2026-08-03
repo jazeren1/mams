@@ -20,6 +20,7 @@ from mams.cli import (
     run_identify_evaluate,
     run_ingest_approve,
     run_ingest_audit,
+    run_ingest_confirm_identity,
     run_ingest_plan,
     run_ingest_plans,
     run_ingest_show,
@@ -109,6 +110,33 @@ def _seed_and_resolve(tmp_path: Path) -> tuple[object, int]:
     return config, media_file_id
 
 
+def _seed_and_resolve_manual(tmp_path: Path, *, filename: str = "Alien.mkv") -> tuple[object, int]:
+    """Same as `_seed_and_resolve`, but the assignment is MANUAL (and
+    unconfirmed) -- reproduces the production "resolve select then stuck
+    plan" scenario this milestone fixes."""
+    incoming_root = tmp_path / "Incoming"
+    _touch(incoming_root / filename)
+    config = load_config(_write_config(tmp_path, incoming_root=incoming_root, nas_root=tmp_path / "NAS"))
+    run_inventory_scan(config, json_output=False, output=_report_path(tmp_path))
+    run_identify_evaluate(config)
+
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        candidate = list_candidates(connection)[0]
+        _mark_media_file_healthy(connection, candidate.media_file_id)
+        identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=8077, title="Alien³", release_year=1992)
+        assign_identity(
+            connection, media_file_id=candidate.media_file_id, identification_candidate_id=candidate.id,
+            external_identity_id=identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+        )
+        connection.commit()
+        media_file_id = candidate.media_file_id
+    finally:
+        connection.close()
+    return config, media_file_id
+
+
 # --- parser -----------------------------------------------------------------
 
 
@@ -128,6 +156,14 @@ def test_parser_accepts_plans_show_stats_approve() -> None:
     assert build_parser().parse_args(["ingest", "show", "1"]).plan_id == 1
     assert build_parser().parse_args(["ingest", "stats"]).ingest_command == "stats"
     assert build_parser().parse_args(["ingest", "approve", "1"]).plan_id == 1
+
+
+def test_parser_accepts_confirm_identity() -> None:
+    args = build_parser().parse_args(["ingest", "confirm-identity", "33", "--json"])
+    assert args.command == "ingest"
+    assert args.ingest_command == "confirm-identity"
+    assert args.plan_id == 33
+    assert args.json is True
 
 
 # --- incoming files flow through the canonical inventory scan ------------------
@@ -373,3 +409,166 @@ def test_run_ingest_audit_always_reports_all_checks(tmp_path: Path, capsys: pyte
 
     assert result is not None
     assert len(result.checks) == 25
+
+
+# --- confirm-identity (Milestone 8.3) -------------------------------------------
+
+
+def test_run_ingest_confirm_identity_unblocks_replan_and_approval(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exact production scenario this fix addresses: a manually
+    selected identity leaves the plan stuck REVIEW_REQUIRED until
+    confirm-identity is run and the plan is regenerated."""
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    assert plan.status == "REVIEW_REQUIRED"
+    capsys.readouterr()
+
+    assignment = run_ingest_confirm_identity(config, plan.id)
+    assert assignment is not None
+    assert assignment.confirmed_for_ingest_at is not None
+
+    unchanged = run_ingest_show(config, plan.id)
+    assert unchanged is not None
+    assert unchanged.status == "REVIEW_REQUIRED"  # confirm-identity never changes plan status itself
+
+    replanned = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert replanned is not None
+    assert replanned.id == plan.id
+    assert replanned.status == "READY_FOR_REVIEW"
+
+    approved = run_ingest_approve(config, plan.id)
+    assert approved is not None
+    assert approved.status == "APPROVED"
+
+    result = run_ingest_audit(config, plan.id)
+    assert result is not None
+    assert result.readiness_status.value == "READY_FOR_EXECUTOR"
+
+
+def test_run_ingest_confirm_identity_prints_next_commands_with_real_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    capsys.readouterr()
+
+    run_ingest_confirm_identity(config, plan.id)
+
+    out = capsys.readouterr().out
+    assert "Identity confirmed for ingest" in out
+    assert f"ingest plan {media_file_id} --destination-category movie" in out
+    assert f"ingest approve {plan.id}" in out
+
+
+def test_run_ingest_confirm_identity_is_idempotent(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    run_ingest_confirm_identity(config, plan.id)
+    capsys.readouterr()
+
+    second = run_ingest_confirm_identity(config, plan.id)
+
+    assert second is not None
+    out = capsys.readouterr().out
+    assert "already confirmed" in out
+
+
+def test_run_ingest_confirm_identity_rejects_auto_assignment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _seed_and_resolve(tmp_path)  # AUTO assignment
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    assert plan.status == "READY_FOR_REVIEW"
+    capsys.readouterr()
+
+    result = run_ingest_confirm_identity(config, plan.id)
+
+    assert result is None
+    assert "AUTO" in capsys.readouterr().out
+
+
+def test_run_ingest_confirm_identity_unknown_plan(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    incoming_root = tmp_path / "Incoming"
+    incoming_root.mkdir(parents=True)
+    config = load_config(_write_config(tmp_path, incoming_root=incoming_root, nas_root=tmp_path / "NAS"))
+    migrate(config.database_path)
+
+    result = run_ingest_confirm_identity(config, 999999)
+
+    assert result is None
+    assert "No ingest plan" in capsys.readouterr().out
+
+
+def test_run_ingest_confirm_identity_rejects_stale_assignment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        candidate = list_candidates(connection)[0]
+        other_identity = upsert_external_identity(connection, media_type="MOVIE", provider_id=679, title="Aliens", release_year=1986)
+        assign_identity(
+            connection, media_file_id=media_file_id, identification_candidate_id=candidate.id,
+            external_identity_id=other_identity.id, resolution_attempt_id=None, assignment_method="MANUAL", confidence="MEDIUM",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    capsys.readouterr()
+
+    result = run_ingest_confirm_identity(config, plan.id)
+
+    assert result is None
+    assert "regenerate the plan" in capsys.readouterr().out
+
+
+def test_run_ingest_show_distinguishes_identity_and_approval_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    capsys.readouterr()
+
+    run_ingest_show(config, plan.id)
+    out = capsys.readouterr().out
+    assert "Manually selected" in out
+    assert "Confirmed for ingest: NO" in out
+    assert "Plan approved: NO" in out
+
+    run_ingest_confirm_identity(config, plan.id)
+    replanned = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert replanned is not None
+    run_ingest_approve(config, plan.id)
+    capsys.readouterr()
+
+    run_ingest_show(config, plan.id)
+    out = capsys.readouterr().out
+    assert "Confirmed for ingest: YES" in out
+    assert "Plan approved: YES" in out
+
+
+def test_run_ingest_show_json_includes_identity_assignment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, media_file_id = _seed_and_resolve_manual(tmp_path)
+    plan = run_ingest_plan(config, media_file_id, destination_category="movie")
+    assert plan is not None
+    capsys.readouterr()
+
+    run_ingest_show(config, plan.id, json_output=True)
+
+    out = capsys.readouterr().out
+    assert '"identity_assignment"' in out
+    assert '"assignment_method": "MANUAL"' in out
+    assert '"confirmed_for_ingest_at": null' in out

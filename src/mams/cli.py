@@ -333,6 +333,16 @@ def build_parser() -> argparse.ArgumentParser:
     stats_ingest_parser = ingest_subs.add_parser("stats", help="Show dry-run ingest plan statistics. Read-only.")
     stats_ingest_parser.add_argument("--json", action="store_true")
 
+    confirm_identity_ingest_parser = ingest_subs.add_parser(
+        "confirm-identity",
+        help=(
+            "Explicitly confirm a manually selected identity for ingest. Database-only; required before a "
+            "REVIEW_REQUIRED plan with a manually selected identity can become READY_FOR_REVIEW via 'ingest plan'."
+        ),
+    )
+    confirm_identity_ingest_parser.add_argument("plan_id", type=int)
+    confirm_identity_ingest_parser.add_argument("--json", action="store_true")
+
     approve_ingest_parser = ingest_subs.add_parser(
         "approve", help="Mark a READY_FOR_REVIEW plan APPROVED. Database state only -- no actions are executed."
     )
@@ -1747,13 +1757,36 @@ def run_resolve_cache_clear(config: AppConfig, *, json_output: bool = False) -> 
     return deleted
 
 
-def _render_ingest_plan_text(plan: ingest_repository.PlanRecord) -> str:
+def _render_identity_lines(assignment: resolution_repository.AssignmentRecord | None, plan_approved: bool) -> list[str]:
+    """Renders the three facts an operator must be able to tell apart at
+    a glance for a MANUAL identity: it was manually selected, whether
+    that selection has been explicitly confirmed for ingest, and whether
+    the plan itself (a separate, later step) has been approved."""
+    if assignment is None:
+        return []
+    lines = ["", "Identity:"]
+    if assignment.assignment_method == "MANUAL":
+        lines.append(f"  Manually selected (assignment #{assignment.id})")
+        if assignment.confirmed_for_ingest_at is not None:
+            lines.append(f"  Confirmed for ingest: YES ({assignment.confirmed_for_ingest_at}, by {assignment.confirmed_by})")
+        else:
+            lines.append("  Confirmed for ingest: NO -- run 'mams ingest confirm-identity PLAN_ID'")
+    else:
+        lines.append(f"  Automatically resolved (assignment #{assignment.id}); no ingest confirmation required")
+    lines.append(f"  Plan approved: {'YES' if plan_approved else 'NO'}")
+    return lines
+
+
+def _render_ingest_plan_text(
+    plan: ingest_repository.PlanRecord, *, assignment: resolution_repository.AssignmentRecord | None = None
+) -> str:
     lines = ["MAMS Dry-Run Ingest Plan", "=" * 24, "", f"Plan #{plan.id}"]
     lines.append(f"Status: {plan.status}")
     lines.append("Execution: NOT PERFORMED")
     lines.append("")
     lines.append("Source:")
     lines.append(f"  {plan.source_path}")
+    lines.extend(_render_identity_lines(assignment, plan.approved_at is not None))
     if plan.verification_status:
         lines.append("")
         lines.append(f"Verification: {plan.verification_status}")
@@ -1779,6 +1812,17 @@ def _render_ingest_plan_text(plan: ingest_repository.PlanRecord) -> str:
     return "\n".join(lines)
 
 
+def _get_plan_assignment(
+    connection: sqlite3.Connection, plan: ingest_repository.PlanRecord
+) -> resolution_repository.AssignmentRecord | None:
+    """Read-only lookup of the identity assignment a plan was generated
+    against, for display purposes only (`ingest plan`/`ingest show`) --
+    mirrors `run_ingest_audit`'s separate `last_execution` lookup."""
+    if plan.media_identity_assignment_id is None:
+        return None
+    return resolution_repository.get_assignment(connection, plan.media_identity_assignment_id)
+
+
 def run_ingest_plan(
     config: AppConfig, media_file_id: int, *, destination_category: str | None = None, json_output: bool = False
 ) -> ingest_repository.PlanRecord | None:
@@ -1797,13 +1841,16 @@ def run_ingest_plan(
         except ingest_service.IngestPlanError as exc:
             console.print(f"[red]{exc}[/red]")
             return None
+        assignment = _get_plan_assignment(connection, plan)
     finally:
         connection.close()
 
     if json_output:
-        console.print_json(data=plan.to_dict())
+        data = plan.to_dict()
+        data["identity_assignment"] = assignment.to_dict() if assignment is not None else None
+        console.print_json(data=data)
     else:
-        console.print(_render_ingest_plan_text(plan))
+        console.print(_render_ingest_plan_text(plan, assignment=assignment))
     return plan
 
 
@@ -1846,6 +1893,7 @@ def run_ingest_show(config: AppConfig, plan_id: int, *, json_output: bool = Fals
     connection = connect(config.database_path)
     try:
         plan = ingest_repository.get_plan(connection, plan_id)
+        assignment = _get_plan_assignment(connection, plan) if plan is not None else None
     finally:
         connection.close()
 
@@ -1854,9 +1902,11 @@ def run_ingest_show(config: AppConfig, plan_id: int, *, json_output: bool = Fals
         return None
 
     if json_output:
-        console.print_json(data=plan.to_dict())
+        data = plan.to_dict()
+        data["identity_assignment"] = assignment.to_dict() if assignment is not None else None
+        console.print_json(data=data)
     else:
-        console.print(_render_ingest_plan_text(plan))
+        console.print(_render_ingest_plan_text(plan, assignment=assignment))
     return plan
 
 
@@ -1880,6 +1930,69 @@ def run_ingest_stats(config: AppConfig, *, json_output: bool = False) -> ingest_
     else:
         console.print(_render_ingest_stats_text(stats))
     return stats
+
+
+def _infer_destination_category(config: AppConfig, plan: ingest_repository.PlanRecord) -> str | None:
+    """Best-effort reverse lookup of the `--destination-category` value
+    that produced `plan.destination_library`, purely for the operator
+    hint printed after `confirm-identity` -- never used for anything
+    that affects plan generation itself. `None` if the plan has no
+    destination yet (e.g. it was never given one)."""
+    if plan.destination_library is None:
+        return None
+    category_key = next((key for key, root in config.nas_categories.items() if root == plan.destination_library), None)
+    if category_key is None:
+        return None
+    return next((name for name, key in config.ingest_destination_categories.items() if key == category_key), None)
+
+
+def run_ingest_confirm_identity(
+    config: AppConfig, plan_id: int, *, json_output: bool = False
+) -> resolution_repository.AssignmentRecord | None:
+    """Explicitly confirm the manually selected identity behind a dry-run
+    ingest plan for ingest -- the step between `resolve select` and
+    regenerating the plan (`mams ingest plan`) that lets a REVIEW_REQUIRED
+    plan with a MANUAL assignment reach READY_FOR_REVIEW. Database-only --
+    no filesystem change, no Plex call, and this command never changes
+    the plan's own status itself (see `ingest_service.confirm_identity`).
+    Returns None (after printing a clear error) for an unknown plan, a
+    plan with no resolved identity assignment, an assignment that no
+    longer matches the plan's snapshot (replan first), or an assignment
+    that doesn't need confirmation (AUTO, or no longer ACTIVE)."""
+    migrate(config.database_path)
+    connection = connect(config.database_path)
+    try:
+        plan = ingest_repository.get_plan(connection, plan_id)
+        already_confirmed = False
+        if plan is not None and plan.media_identity_assignment_id is not None:
+            existing = resolution_repository.get_assignment(connection, plan.media_identity_assignment_id)
+            already_confirmed = existing is not None and existing.confirmed_for_ingest_at is not None
+        try:
+            assignment = ingest_service.confirm_identity(connection, plan_id)
+        except ingest_service.IngestPlanError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return None
+    finally:
+        connection.close()
+
+    assert plan is not None
+    if json_output:
+        console.print_json(data=assignment.to_dict())
+    else:
+        if already_confirmed:
+            console.print(
+                f"[yellow]Assignment #{assignment.id} was already confirmed for ingest "
+                f"({assignment.confirmed_for_ingest_at}, by {assignment.confirmed_by}).[/yellow]"
+            )
+        else:
+            console.print(f"[green]Identity confirmed for ingest (assignment #{assignment.id}).[/green]")
+        console.print("No filesystem or plan-status changes were made. Regenerate the plan next:")
+        console.print("")
+        category = _infer_destination_category(config, plan)
+        category_arg = f" --destination-category {category}" if category else " --destination-category CATEGORY"
+        console.print(f"  python -m mams.cli ingest plan {plan.media_file_id}{category_arg}")
+        console.print(f"  python -m mams.cli ingest approve {plan.id}")
+    return assignment
 
 
 def run_ingest_approve(config: AppConfig, plan_id: int, *, json_output: bool = False) -> ingest_repository.PlanRecord | None:
@@ -2356,6 +2469,8 @@ def main() -> None:
             run_ingest_show(config, args.plan_id, json_output=args.json)
         elif args.ingest_command == "stats":
             run_ingest_stats(config, json_output=args.json)
+        elif args.ingest_command == "confirm-identity":
+            run_ingest_confirm_identity(config, args.plan_id, json_output=args.json)
         elif args.ingest_command == "approve":
             run_ingest_approve(config, args.plan_id, json_output=args.json)
         elif args.ingest_command == "audit":
