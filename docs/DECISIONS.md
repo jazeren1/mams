@@ -24,3 +24,7 @@
 - D-015: Dry-run ingest planning computes proposed actions but performs
   none; approval is a database state change only until a future
   milestone implements an executor.
+- D-016: "Which identity a file has" (`resolve select`) and "an operator
+  has reviewed that manual choice for ingest" (`ingest confirm-identity`)
+  are two separate confirmations, not one -- a `MANUAL` assignment is
+  never treated as ingest-ready merely because it was selected.

@@ -158,3 +158,45 @@ Omitting `--category` preserves the original full-scan behavior exactly
 (same default report paths, same JSON/text shape). No identification,
 resolution, planning, or execution is triggered by a scan, scoped or
 not — that remains a separate, explicit step in the operator workflow.
+
+## Milestone 8.3: explicit ingest confirmation for manually selected identities
+
+`resolve select ATTEMPT_ID MATCH_ID` confirms *which* external identity a
+file has (creating a `MANUAL` `media_identity_assignments` row), but
+`ingest_service.generate_plan` has always separately required that
+identity to be reviewed *for ingest* before a plan can reach
+`READY_FOR_REVIEW` — a `MANUAL` assignment unconditionally produced the
+review reason "identity was manually selected and has not yet been
+confirmed for ingest". No command ever existed to satisfy that reason:
+`resolve select` doesn't clear it (by design — it's a different,
+identity-level confirmation), and no amount of re-running `ingest plan`
+changes a permanent `assignment_method`. A plan generated against a
+`MANUAL` assignment (e.g. after a runtime-disagreement `REVIEW_REQUIRED`
+resolution attempt) was therefore permanently stuck `REVIEW_REQUIRED`,
+unable to reach `APPROVED` through any existing command.
+
+`mams ingest confirm-identity PLAN_ID` closes that gap: it validates that
+the plan's snapshotted identity assignment is still the file's current
+`ACTIVE` one (rejecting a stale/superseded assignment with a clear error
+directing the operator to regenerate the plan first), then sets
+`media_identity_assignments.confirmed_for_ingest_at`/`confirmed_by`
+(migration `0016`) on that exact assignment row via
+`resolution_repository.confirm_assignment_for_ingest`. It never changes
+the plan's own status — the operator must regenerate the plan
+(`mams ingest plan MEDIA_FILE_ID ...`) afterward, the same "explicit
+commands perform changes" discipline every other blocking/review reason
+already follows. `generate_plan` now only adds the review reason when
+`assignment_method == 'MANUAL' and confirmed_for_ingest_at is None`, so
+an `AUTO` plan's path is completely unaffected, and a fresh `MANUAL`
+assignment still requires this explicit step (confirmation is never
+implied by selection alone).
+
+Confirmation lives on the assignment row, not the plan, because
+`assign_identity()` always inserts a brand-new row for a changed
+identity rather than updating one in place — a superseding manual
+selection therefore starts unconfirmed by construction, with no
+additional code needed to prevent confirmation from silently carrying
+over to a different identity. `readiness.py`'s execution-readiness audit
+needed no change: its existing `active_assignment_matches_plan` check
+already fails a plan whose approved assignment has since been replaced,
+regardless of confirmation state.

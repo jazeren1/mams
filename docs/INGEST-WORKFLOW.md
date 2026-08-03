@@ -2,9 +2,9 @@
 
 This document walks the exact, current CLI workflow from a disposable file
 in `Incoming` through execution and canonical inventory reconciliation.
-Steps 1 through 11 are entirely read-only or database-only writes —
+Steps 1 through 12 are entirely read-only or database-only writes —
 **no command through the execution-readiness audit executes a media
-action.** Step 12, `mams ingest execute`, is the one command that
+action.** Step 13, `mams ingest execute`, is the one command that
 mutates the filesystem, and only for one `APPROVED`,
 `READY_FOR_EXECUTOR` plan at a time, only with an exact
 `--confirm-plan` match. See `docs/EXECUTION-SAFETY.md` for its full
@@ -194,7 +194,49 @@ status is:
   verification, a collision) that must be fixed before this plan can be
   approved.
 
-### 10. Approve the plan
+### 10. Confirm a manually selected identity for ingest (if required)
+
+If step 9 shows `REVIEW_REQUIRED` with the reason "identity was manually
+selected and has not yet been confirmed for ingest" (i.e. step 7 used
+`resolve select`, not an auto-resolved match), `resolve select` alone is
+**not** sufficient to approve this plan — it confirms *which* external
+identity the file has, but not that an operator has separately reviewed
+and accepted that specific manual choice *for this ingest*. Runtime
+disagreement (or any other scoring gap large enough to miss the
+auto-resolve bar) is exactly the situation this second, explicit gate
+exists for: an operator, not the scorer, made the final call, so a
+second command makes that call auditable on its own, distinct from the
+plan approval that follows.
+
+```
+mams ingest confirm-identity PLAN_ID
+```
+
+Confirms the exact identity assignment `PLAN_ID` was generated against
+— it fails with a clear error, rather than confirming the wrong thing,
+if a later `resolve select`/`resolve evaluate` has since changed the
+file's active assignment (regenerate the plan first in that case), or if
+the assignment was already automatically resolved (`AUTO` needs no
+confirmation). **Database-only**; no filesystem change. Repeating it is
+safe — an already-confirmed assignment is reported unchanged. This
+command never changes `PLAN_ID`'s own status: it only records that the
+identity has been reviewed. To see that reflected as `READY_FOR_REVIEW`,
+regenerate the plan:
+
+```
+mams ingest plan MEDIA_FILE_ID --destination-category CATEGORY
+```
+
+`mams ingest plan` reconciles the *existing* current plan for that media
+file in place (same plan id, incremented `plan_version`) rather than
+creating a new one — the plan created back in step 8 is the plan that
+should be approved next, not a new one. `mams ingest confirm-identity`
+prints these two exact follow-up commands (with real ids filled in)
+after it succeeds.
+
+An auto-resolved plan never shows this reason and never needs this step.
+
+### 11. Approve the plan
 
 ```
 mams ingest approve PLAN_ID
@@ -208,7 +250,15 @@ updates an unapproved plan in place, but marks an **`APPROVED`** plan
 **`SUPERSEDED`** instead of silently mutating it, then inserts a fresh
 current plan — an approval is a snapshot, never edited under you.
 
-### 11. Run the execution-readiness audit
+`--confirm-plan` (step 13) is a completely separate confirmation from
+step 10's identity confirmation: step 10 confirms *which identity* an
+operator accepted for review; `approve` confirms the *plan* (identity,
+destination, verification, actions) is ready to execute;
+`--confirm-plan PLAN_ID` on `ingest execute` confirms *this exact
+already-`APPROVED` plan, right now, is the one to execute*. None of the
+three substitutes for either of the others.
+
+### 12. Run the execution-readiness audit
 
 ```
 mams ingest audit PLAN_ID
@@ -243,7 +293,7 @@ accurate, actionable description of what should happen right now. It
 never regenerates a plan or re-resolves an identity by itself — it only
 reports.
 
-### 12. Execute the plan
+### 13. Execute the plan
 
 ```
 mams ingest execute PLAN_ID
@@ -311,7 +361,13 @@ The rolling loop:
 4. `mams identify evaluate` then `mams identify list --category incoming`
 5. `mams resolve evaluate`
 6. `mams ingest plan MEDIA_FILE_ID --destination-category ...`, then
-   `mams ingest show PLAN_ID` to inspect it
+   `mams ingest show PLAN_ID` to inspect it. If step 5 auto-resolved, this
+   is `READY_FOR_REVIEW`; if it required `resolve select` (step 7 above,
+   e.g. a runtime disagreement), this is `REVIEW_REQUIRED` and needs the
+   confirm-then-replan pair below first.
+6a. Only if `resolve select` was used: `mams ingest confirm-identity
+    PLAN_ID`, then re-run step 6's `mams ingest plan ...` to reach
+    `READY_FOR_REVIEW`.
 7. `mams ingest approve PLAN_ID`
 8. `mams ingest audit PLAN_ID`
 9. `mams ingest execute PLAN_ID --confirm-plan PLAN_ID` — one plan at a
@@ -345,6 +401,7 @@ Notes on this loop:
 | Identification source | `PARSED` / `MANUAL_OVERRIDE` | Which candidate resolution actually used (`mams identify show-effective`). |
 | Resolution attempt | `RESOLVED` / `REVIEW_REQUIRED` / `NO_MATCH` / `FAILED` / `SKIPPED` | Outcome of one TMDb search+score against one candidate. |
 | Assignment method | `AUTO` / `MANUAL` | How the current external identity was confirmed for a file. |
+| Ingest confirmation | `confirmed_for_ingest_at` set / unset | Whether a `MANUAL` assignment has been explicitly confirmed for ingest (`mams ingest confirm-identity PLAN_ID`, step 10); always unset for `AUTO`, never required for it. |
 | Plan status | `READY_FOR_REVIEW` / `REVIEW_REQUIRED` / `BLOCKED` / `APPROVED` / `SUPERSEDED` / `EXECUTING` / `EXECUTED` / `EXECUTION_FAILED` / `RECOVERY_REQUIRED` | Where a plan stands, through and including execution. |
 | Readiness status | `READY_FOR_EXECUTOR` / `STALE` / `BLOCKED` / `INCOMPLETE` | Whether an approved plan is still safe to execute right now. |
 | Execution status | `EXECUTING` / `SUCCEEDED` / `FAILED` / `RECOVERY_REQUIRED` | One execution attempt's outcome. |
@@ -352,8 +409,8 @@ Notes on this loop:
 
 ## Safety guarantees, restated
 
-- Steps 1 through 11 create no directory, rename, move, copy, or delete
-  no file — anywhere, ever. Step 12 is the sole exception, and only for
+- Steps 1 through 12 create no directory, rename, move, copy, or delete
+  no file — anywhere, ever. Step 13 is the sole exception, and only for
   one plan at a time with an exact `--confirm-plan` match.
 - No destination is ever overwritten — enforced structurally (an atomic
   exclusive-create primitive), not just by a pre-check.

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.3
+
+Fixed: a manually selected identity (`mams resolve select ATTEMPT_ID
+MATCH_ID`) left its dry-run ingest plan permanently stuck
+`REVIEW_REQUIRED`, with no command able to advance it to `APPROVED`.
+`resolve select` confirms *which* external identity a file has, but
+`ingest_service.generate_plan` has always separately required that
+choice to be reviewed *for ingest* -- a requirement no command could
+ever satisfy. Added `mams ingest confirm-identity PLAN_ID`: confirms the
+exact `MANUAL` assignment a plan was generated against (rejecting a
+stale/superseded assignment or an `AUTO` assignment that needs no
+confirmation), after which regenerating the plan (`mams ingest plan
+MEDIA_FILE_ID ...`) reaches `READY_FOR_REVIEW` as normal. See
+`docs/ARCHITECTURE.md`'s "Milestone 8.3" entry, `docs/DECISIONS.md`
+D-016, and the new "Confirm a manually selected identity for ingest"
+step in `docs/INGEST-WORKFLOW.md`.
+
+`media_identity_assignments` gains `confirmed_for_ingest_at`/
+`confirmed_by` (migration `0016`), nullable and unset by every existing
+row; `AUTO` assignments never need or use them.
+`ingest_service.generate_plan`'s MANUAL review reason now only fires
+when `confirmed_for_ingest_at IS NULL`, so this is purely additive: every
+`AUTO`-resolved plan's behavior, and a *fresh* `MANUAL` assignment's
+`REVIEW_REQUIRED` outcome, are both unchanged. Confirmation lives on the
+assignment row (not the plan) so it survives plan regeneration but never
+carries over to a replacement assignment -- `assign_identity()` always
+inserts a new row for a changed identity. `mams ingest confirm-identity`
+never itself changes a plan's status; `mams ingest show` now also
+displays whether a `MANUAL` identity has been confirmed for ingest and
+whether the plan has been approved, alongside the existing plan status.
+
 ## 0.8.2
 
 Added category-scoped inventory scanning: `mams inventory scan --category

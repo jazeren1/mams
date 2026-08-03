@@ -668,6 +668,23 @@ when the current `ACTIVE` row already matches the requested
 `(external_identity_id, assignment_method, confidence)` — repeated
 evaluation with an unchanged outcome never creates duplicate history.
 
+`confirmed_for_ingest_at`/`confirmed_by` (Milestone 8.3, migration
+`0016`) record a second, independent fact from `assignment_method`:
+whether an operator has explicitly reviewed and accepted a `MANUAL`
+assignment *for ingest*, via `mams ingest confirm-identity PLAN_ID`
+(`resolution_repository.confirm_assignment_for_ingest`). `resolve select`
+confirms *which* identity a file has; these columns confirm that a human
+has separately signed off on using that specific manual choice for this
+ingest — `ingest_service.generate_plan`'s "identity was manually
+selected and has not yet been confirmed for ingest" review reason checks
+this column, not `assignment_method` alone. Both columns are nullable
+and unset by every `AUTO` assignment (confirmation is never required for
+one) and by every historical row predating this migration. Because
+`assign_identity()` always inserts a brand-new row for a changed
+identity rather than updating one in place, confirmation never carries
+over to a replacement assignment — a new manual selection always starts
+unconfirmed.
+
 ### `ingest_plans` / `ingest_plan_actions`
 
 One current (non-`SUPERSEDED`) dry-run plan per media file, enforced by a
@@ -1317,6 +1334,12 @@ Numbered, forward-only SQL files under `database/migrations/`:
   COLUMN scan_scope`/`scope_category` (same narrow-window caveat), so
   scan history distinguishes a full scan from a `--category`-scoped one.
   See "Category-scoped scanning" below.
+- `0016_media_identity_assignment_confirmation.sql` — Milestone 8.3:
+  `ALTER TABLE media_identity_assignments ADD COLUMN
+  confirmed_for_ingest_at`/`confirmed_by` (same narrow-window caveat), so
+  a `MANUAL` assignment can be explicitly confirmed for ingest,
+  independent of and after `resolve select`. See "`media_identity_assignments`"
+  above.
 
 `schema_version` tracks the highest applied migration number. A migration
 runner applies any file numbered above the current version, in order,
