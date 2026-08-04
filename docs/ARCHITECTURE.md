@@ -200,3 +200,40 @@ over to a different identity. `readiness.py`'s execution-readiness audit
 needed no change: its existing `active_assignment_matches_plan` check
 already fails a plan whose approved assignment has since been replaced,
 regardless of confirmation state.
+
+## Milestone 8.4: replacement ingest after a manually removed destination
+
+An executed file can be removed from the NAS by an operator outside of
+MAMS entirely (e.g. it had the wrong audio commentary track). The next
+`mams inventory scan` of that category correctly reconciles the
+canonical `media_files` row to `state='MISSING'` — never deleted, per
+"never destroy data" — but a corrected replacement file placed in
+Incoming and pointed at the exact same destination could never get a
+plan past `BLOCKED`: `_check_collisions()` (`generate_plan`) and the
+identically-patterned code in `audit_plan()` both checked canonical
+inventory with no `state` filter (`SELECT 1 FROM media_files WHERE
+absolute_path = ?`) and excluded only `SUPERSEDED` from the
+competing-plan query, so a `MISSING` historical row and the original
+`EXECUTED` plan both still reported a collision, permanently.
+
+Fixed at the query level in both call sites (via two small shared
+helpers, `_canonical_inventory_occupies_destination`/
+`_competing_plan_id`, so the same fix can't drift out of sync between
+`generate_plan` and `audit_plan` the way the original bug did): canonical
+inventory now requires `state = 'ACTIVE'`; the competing-plan query now
+excludes an explicit `_NON_COMPETING_PLAN_STATUSES = {EXECUTED,
+SUPERSEDED}` — both terminal, never reused or reactivated by any code
+path — rather than only `SUPERSEDED`. Deliberately an exclusion list, not
+an inclusion list, so an unrecognized future status defaults to
+blocking. Every other status, including `EXECUTION_FAILED`/
+`RECOVERY_REQUIRED` (which may still have unresolved or partial
+filesystem state — see `docs/EXECUTION-SAFETY.md`) and any genuinely
+active or unresolved plan (`DRAFT`, `READY_FOR_REVIEW`,
+`REVIEW_REQUIRED`, `BLOCKED`, `APPROVED`, `EXECUTING`) for a *different*
+media file targeting the same destination, keeps blocking exactly as
+before — this fix narrows a false positive, it does not weaken
+collision protection. The real on-disk existence check
+(`Path(plan.full_path).exists()`) is completely independent of database
+state and was never affected. Purely a query-side change: no migration,
+no new command, no write to the historical `EXECUTED` plan or `MISSING`
+media file record.

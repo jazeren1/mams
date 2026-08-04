@@ -175,6 +175,31 @@ collisions — against canonical inventory, other active plans, and a
 read-only filesystem existence check (never a write). Every plan prints
 "No actions were executed."
 
+**Replacing a file after a manually removed destination.** If a
+previously executed file was later deleted from the NAS *outside* of
+MAMS (not via `mams ingest execute`), a subsequent `mams inventory scan`
+of that category correctly reconciles the old canonical `media_files`
+row to `state='MISSING'` — it stays in the database as historical
+evidence a file used to be there, it is never deleted (`docs/DATABASE.md`:
+nothing in this codebase deletes a `media_files` row). A `MISSING` row
+does **not** represent an existing destination, so it does not collide
+with a fresh replacement plan for the exact same destination path — only
+an `ACTIVE` canonical row does. Likewise, the historical plan that
+produced the removed file stays `EXECUTED` forever (a genuine terminal
+success, never reused or reactivated) and does not count as a competing
+plan either; only `SUPERSEDED` and `EXECUTED` are excluded this way —
+every other plan status, including `EXECUTION_FAILED`/
+`RECOVERY_REQUIRED` (which may still have unresolved or partial
+filesystem state; see `docs/EXECUTION-SAFETY.md`) and any genuinely
+active or unresolved plan (`READY_FOR_REVIEW`, `REVIEW_REQUIRED`,
+`BLOCKED`, `APPROVED`, `EXECUTING`) for a *different* file targeting the
+same destination, still blocks planning exactly as before. A file
+physically present on disk at the destination always blocks planning
+regardless of what canonical inventory or plan history says — that check
+is independent of database state entirely. Regenerating a plan for the
+replacement file never alters the historical `EXECUTED` plan or
+`MISSING` media file record in any way.
+
 ### 9. Review verification, destination, collisions, and proposed actions
 
 ```

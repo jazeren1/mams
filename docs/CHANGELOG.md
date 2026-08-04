@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.4
+
+Fixed: a corrected replacement file for a previously executed, then
+manually-removed-from-the-NAS movie could never get a fresh ingest plan.
+`ingest_service._check_collisions()` (and the identically-affected
+`audit_plan()`) checked canonical inventory with `SELECT 1 FROM
+media_files WHERE absolute_path = ?`, with no `state` filter -- so a
+`MISSING` historical row (the canonical, correct outcome of a scan
+reconciling a manually deleted file, never itself deleted -- see
+"never destroy data") still reported "destination path already exists in
+canonical inventory." The competing-plan query excluded only
+`SUPERSEDED`, so the original `EXECUTED` plan -- a genuine, permanent
+terminal success, never reused or reactivated -- still reported "another
+active plan targets the same destination." Both checks now require
+`state = 'ACTIVE'`/exclude only `{EXECUTED, SUPERSEDED}` respectively;
+every other plan status, including `EXECUTION_FAILED`/`RECOVERY_REQUIRED`
+(which may still have unresolved filesystem state) and any genuinely
+active or unresolved plan, still blocks exactly as before. See
+`docs/DATABASE.md`'s new `ingest_plans` note and
+`docs/INGEST-WORKFLOW.md`'s "Replacing a file after a manually removed
+destination."
+
+Purely a query-side fix -- no migration, no new command, no change to
+what a `MANUAL` vs `AUTO` assignment or `READY_FOR_REVIEW`/`APPROVED`/
+`EXECUTING`/`REVIEW_REQUIRED`/`BLOCKED` plan means. The historical
+`EXECUTED` plan and its `MISSING` media file record are never written to
+by this fix -- both remain exactly as reconciliation left them.
+
 ## 0.8.3
 
 Fixed: a manually selected identity (`mams resolve select ATTEMPT_ID

@@ -28,3 +28,8 @@
   has reviewed that manual choice for ingest" (`ingest confirm-identity`)
   are two separate confirmations, not one -- a `MANUAL` assignment is
   never treated as ingest-ready merely because it was selected.
+- D-017: A `MISSING` canonical inventory row and an `EXECUTED`/
+  `SUPERSEDED` ingest plan never block a fresh plan for the same
+  destination -- both are terminal historical facts, never reused or
+  reactivated, and must never be mistaken for an existing collision.
+  Every other plan status still blocks.

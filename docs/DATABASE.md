@@ -207,6 +207,15 @@ A file going `MISSING` on a rescan is a `state` flip, never a `DELETE` —
 consistent with "never destroy data." Its row, and its track rows, are
 left intact.
 
+**Collision detection (Milestone 8.4) only ever treats an `ACTIVE` row as
+occupying its `absolute_path`.** A `MISSING` row is historical evidence a
+file used to be at that path — e.g. an executed file later deleted from
+the NAS outside of MAMS and reconciled `MISSING` by the next scan — never
+a currently-occupied destination. `ingest_service._check_collisions()`
+and `audit_plan()` both filter on `state = 'ACTIVE'` for exactly this
+reason; see `docs/INGEST-WORKFLOW.md`, "Replacing a file after a manually
+removed destination."
+
 ### `video_tracks`, `audio_tracks`, `subtitle_tracks`
 
 The canonical — and only — representation of per-track MediaInfo detail.
@@ -705,6 +714,21 @@ for the exact comparison, which deliberately excludes `status` from the
 recreated wholesale whenever its parent plan's content is regenerated.
 Every action's `details_json` carries `{"execution_state":
 "PROPOSED_NOT_EXECUTED"}`; no executor exists anywhere in this codebase.
+
+**Which plan statuses count as a "competing plan" for collision
+detection (Milestone 8.4).** `_check_collisions()`/`audit_plan()` treat
+another media file's plan targeting the same destination as blocking
+unless its status is `EXECUTED` or `SUPERSEDED` — both are terminal and
+never reused or reactivated by any code path (`EXECUTED` is set exactly
+once, at the end of a successful `execute_plan()` run; `SUPERSEDED` is
+set only by `reconcile_plan` superseding a stale approval). Every other
+status — including `EXECUTION_FAILED`/`RECOVERY_REQUIRED`, which may
+still have unresolved or partial filesystem state (`docs/EXECUTION-SAFETY.md`),
+and any genuinely active or unresolved plan (`DRAFT`, `READY_FOR_REVIEW`,
+`REVIEW_REQUIRED`, `BLOCKED`, `APPROVED`, `EXECUTING`) — keeps blocking.
+This is deliberately an exclusion list rather than an inclusion list: a
+status this set doesn't yet know about defaults to blocking, the safer
+failure mode for a collision check.
 
 ### Incoming as a category
 
