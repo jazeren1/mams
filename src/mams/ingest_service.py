@@ -43,6 +43,50 @@ DESTINATION_CATEGORY_HINTS = frozenset({"movie", "kids_movie", "tv", "kids_tv"})
 _KIND_ALLOWED_CATEGORIES = {"movie": {"movie", "kids_movie"}, "tv": {"tv", "kids_tv"}}
 _PROPOSED_NOT_EXECUTED = {"execution_state": "PROPOSED_NOT_EXECUTED"}
 
+# Plan statuses that do NOT represent destination ownership or active work,
+# and so must never block a fresh plan targeting the same destination.
+# EXECUTED is a genuine terminal success (execution_repository.
+# transition_plan_after_execution's only caller passes it exactly once, at
+# the end of a successful execute_plan() run) -- never reused or
+# reactivated by any code path. SUPERSEDED was already excluded. Every
+# other status (including EXECUTION_FAILED/RECOVERY_REQUIRED, which may
+# still have unresolved or partial filesystem state -- see
+# docs/EXECUTION-SAFETY.md -- and BLOCKED/APPROVED/EXECUTING/REVIEW*/DRAFT,
+# which represent outstanding or in-progress work) keeps blocking.
+# Deliberately an exclusion list, not an inclusion list: a future status
+# this set doesn't yet know about defaults to blocking, the safer failure
+# mode for a collision check.
+_NON_COMPETING_PLAN_STATUSES = frozenset({"EXECUTED", "SUPERSEDED"})
+
+
+def _canonical_inventory_occupies_destination(connection: sqlite3.Connection, full_path: str) -> bool:
+    """True only when an ACTIVE media_files row currently sits at
+    full_path. A MISSING row is historical evidence a file used to be
+    there, not a currently-occupied destination -- e.g. a successfully
+    executed file later removed from the NAS outside of MAMS and
+    reconciled MISSING by a subsequent scan (see docs/DATABASE.md)."""
+    return (
+        connection.execute(
+            "SELECT 1 FROM media_files WHERE absolute_path = ? AND state = 'ACTIVE'", (full_path,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _competing_plan_id(
+    connection: sqlite3.Connection, *, directory: str, filename: str, exclude_media_file_id: int
+) -> int | None:
+    """The id of another media file's non-competing-excluded plan already
+    targeting this exact destination, if any -- see
+    _NON_COMPETING_PLAN_STATUSES for which statuses don't count."""
+    placeholders = ",".join("?" for _ in _NON_COMPETING_PLAN_STATUSES)
+    row = connection.execute(
+        f"SELECT id FROM ingest_plans WHERE destination_directory = ? AND destination_filename = ? "
+        f"AND status NOT IN ({placeholders}) AND media_file_id != ?",
+        (directory, filename, *_NON_COMPETING_PLAN_STATUSES, exclude_media_file_id),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
 
 class IngestPlanError(Exception):
     """Raised for a usage-level rejection *before* any plan row is
@@ -117,16 +161,14 @@ def _check_collisions(
     elif Path(plan.directory).exists() and not Path(plan.directory).is_dir():
         reasons.append(f"destination directory path is occupied by a file: {plan.directory}")
 
-    if connection.execute("SELECT 1 FROM media_files WHERE absolute_path = ?", (plan.full_path,)).fetchone():
+    if _canonical_inventory_occupies_destination(connection, plan.full_path):
         reasons.append("destination path already exists in canonical inventory")
 
-    conflicting = connection.execute(
-        "SELECT id FROM ingest_plans WHERE destination_directory = ? AND destination_filename = ? "
-        "AND status != 'SUPERSEDED' AND media_file_id != ?",
-        (plan.directory, plan.filename, media_file.id),
-    ).fetchone()
-    if conflicting is not None:
-        reasons.append(f"another active plan (#{conflicting['id']}) targets the same destination")
+    conflicting_plan_id = _competing_plan_id(
+        connection, directory=plan.directory, filename=plan.filename, exclude_media_file_id=media_file.id
+    )
+    if conflicting_plan_id is not None:
+        reasons.append(f"another active plan (#{conflicting_plan_id}) targets the same destination")
 
     return reasons
 
@@ -413,14 +455,14 @@ def audit_plan(connection: sqlite3.Connection, config: AppConfig, *, plan_id: in
         full_path = str(PurePosixPath(plan.destination_directory) / plan.destination_filename)
         if Path(full_path).exists():
             destination_still_unoccupied = False
-        elif connection.execute("SELECT 1 FROM media_files WHERE absolute_path = ?", (full_path,)).fetchone():
+        elif _canonical_inventory_occupies_destination(connection, full_path):
             destination_still_unoccupied = False
-        competing = connection.execute(
-            "SELECT id FROM ingest_plans WHERE destination_directory = ? AND destination_filename = ? "
-            "AND status != 'SUPERSEDED' AND media_file_id != ?",
-            (plan.destination_directory, plan.destination_filename, plan.media_file_id),
-        ).fetchone()
-        competing_plan_id = competing["id"] if competing is not None else None
+        competing_plan_id = _competing_plan_id(
+            connection,
+            directory=plan.destination_directory,
+            filename=plan.destination_filename,
+            exclude_media_file_id=plan.media_file_id,
+        )
 
     def _execution_state(details: dict[str, object] | None) -> str | None:
         value = (details or {}).get("execution_state")

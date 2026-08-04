@@ -324,6 +324,219 @@ def test_collision_duplicate_active_plan_targets_same_destination(connection: sq
     assert any("another active plan" in r for r in plan_2.blocking_reasons)
 
 
+# --- replacement ingest after a manually removed destination (production plan
+# 37/39 regression) -----------------------------------------------------------
+
+
+def _seed_canonical_destination_media_file(
+    connection: sqlite3.Connection, tmp_path: Path, *, state: str = "ACTIVE", name: str = "Alien (1979).mkv"
+) -> tuple[int, str]:
+    """Seeds a canonical NAS media_files row at the exact destination path
+    _resolve_movie_identity's default identity (Alien, 1979) computes --
+    either still there (ACTIVE) or historically there but since removed
+    from the NAS and reconciled MISSING by a later scan. Returns
+    (media_file_id, destination_path)."""
+    library_id = _lastrowid(
+        connection.execute(
+            "INSERT INTO libraries (category, root_path) VALUES ('movies', ?)", (str(tmp_path / "NAS" / "Movies"),)
+        )
+    )
+    scan_id = _lastrowid(connection.execute("INSERT INTO scan_runs DEFAULT VALUES"))
+    destination_dir = str(tmp_path / "NAS" / "Movies" / "Alien (1979)")
+    destination_path = str(Path(destination_dir) / name)
+    media_file_id = _lastrowid(
+        connection.execute(
+            """
+            INSERT INTO media_files (
+                library_id, absolute_path, relative_path, filename, extension, parent_directory, layout,
+                size_bytes, state, first_seen_scan_id, last_seen_scan_id
+            ) VALUES (?, ?, ?, ?, '.mkv', ?, 'movie_folder', 1000, ?, ?, ?)
+            """,
+            (library_id, destination_path, name, name, destination_dir, state, scan_id, scan_id),
+        )
+    )
+    return media_file_id, destination_path
+
+
+def _seed_competing_plan(
+    connection: sqlite3.Connection,
+    *,
+    media_file_id: int,
+    status: str,
+    destination_library: str,
+    destination_directory: str,
+    destination_filename: str,
+    source_path: str = "/Incoming/Other.mkv",
+) -> int:
+    """Directly inserts an ingest_plans row in a given status -- test
+    setup only. No application code path reaches EXECUTED/EXECUTING/
+    EXECUTION_FAILED/RECOVERY_REQUIRED through `generate_plan` itself
+    (those are execution-lifecycle transitions owned by
+    execution_repository.py), so tests exercising them as a *competing*
+    plan's status must seed them directly, the same way
+    test_audit_competing_plan_blocks already does for READY_FOR_REVIEW."""
+    return _lastrowid(
+        connection.execute(
+            """
+            INSERT INTO ingest_plans (
+                media_file_id, status, source_path, destination_library, destination_directory, destination_filename
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (media_file_id, status, source_path, destination_library, destination_directory, destination_filename),
+        )
+    )
+
+
+def _seed_competing_plan_via_generate(
+    connection: sqlite3.Connection, config: AppConfig, tmp_path: Path, *, status: str, filename: str = "Other.mkv"
+) -> int:
+    """Generates a real, structurally valid plan for a second Incoming
+    file resolved to the same (Alien, 1979) identity as every other test
+    in this section -- so it targets the exact same destination -- then
+    force-sets its status directly, same rationale as
+    `_seed_competing_plan`."""
+    other_media_file_id = _seed_media_file(connection, tmp_path, name=filename)
+    other_candidate_id = _seed_candidate(connection, media_file_id=other_media_file_id)
+    _resolve_movie_identity(connection, media_file_id=other_media_file_id, candidate_id=other_candidate_id)
+    other_plan = generate_plan(connection, config, media_file_id=other_media_file_id, destination_category="movie")
+    assert other_plan.status == "READY_FOR_REVIEW"
+    connection.execute("UPDATE ingest_plans SET status = ? WHERE id = ?", (status, other_plan.id))
+    return other_plan.id
+
+
+def test_collision_missing_canonical_destination_does_not_block(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    _seed_canonical_destination_media_file(connection, tmp_path, state="MISSING")
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "READY_FOR_REVIEW"
+    assert not any("canonical inventory" in r for r in plan.blocking_reasons)
+
+
+def test_collision_active_canonical_destination_still_blocks(connection: sqlite3.Connection, tmp_path: Path) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    _seed_canonical_destination_media_file(connection, tmp_path, state="ACTIVE")
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "BLOCKED"
+    assert any("canonical inventory" in r for r in plan.blocking_reasons)
+
+
+def test_collision_destination_on_disk_blocks_even_with_missing_canonical_record(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The real-filesystem check is independent of, and unaffected by,
+    this fix's database-state filtering -- a stray file physically on
+    disk must still block regardless of what canonical inventory says."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    _, destination_path = _seed_canonical_destination_media_file(connection, tmp_path, state="MISSING")
+    Path(destination_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(destination_path).write_bytes(b"\0")
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "BLOCKED"
+    assert any("already exists on disk" in r for r in plan.blocking_reasons)
+
+
+@pytest.mark.parametrize("status", ["EXECUTED", "SUPERSEDED"])
+def test_collision_terminal_competing_plan_does_not_block(
+    connection: sqlite3.Connection, tmp_path: Path, status: str
+) -> None:
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    _seed_competing_plan_via_generate(connection, config, tmp_path, status=status)
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "READY_FOR_REVIEW"
+    assert not any("another active plan" in r for r in plan.blocking_reasons)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["READY_FOR_REVIEW", "REVIEW_REQUIRED", "BLOCKED", "APPROVED", "EXECUTING", "EXECUTION_FAILED", "RECOVERY_REQUIRED"],
+)
+def test_collision_active_or_recovery_competing_plan_still_blocks(
+    connection: sqlite3.Connection, tmp_path: Path, status: str
+) -> None:
+    """EXECUTION_FAILED/RECOVERY_REQUIRED must remain blocking -- unlike
+    EXECUTED, these may still have unresolved or partial filesystem
+    state (see docs/EXECUTION-SAFETY.md), so the safest existing
+    behavior is preserved for them."""
+    media_file_id = _seed_media_file(connection, tmp_path)
+    candidate_id = _seed_candidate(connection, media_file_id=media_file_id)
+    _resolve_movie_identity(connection, media_file_id=media_file_id, candidate_id=candidate_id)
+    config = _config(tmp_path)
+    _seed_competing_plan_via_generate(connection, config, tmp_path, status=status)
+
+    plan = generate_plan(connection, config, media_file_id=media_file_id, destination_category="movie")
+
+    assert plan.status == "BLOCKED"
+    assert any("another active plan" in r for r in plan.blocking_reasons)
+
+
+def test_replanning_after_historical_execution_and_manual_removal_succeeds(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """End-to-end regression mirroring the production scenario this fix
+    addresses: an EXECUTED historical plan's destination file was later
+    removed from the NAS outside of MAMS and reconciled MISSING by a
+    scan; a corrected replacement file in Incoming must be able to plan,
+    approve, and audit against the exact same destination, without
+    touching the historical plan or media file."""
+    config = _config(tmp_path)
+    historical_media_file_id, destination_path = _seed_canonical_destination_media_file(
+        connection, tmp_path, state="MISSING"
+    )
+    destination_dir = str(Path(destination_path).parent)
+    destination_filename = Path(destination_path).name
+    historical_plan_id = _seed_competing_plan(
+        connection, media_file_id=historical_media_file_id, status="EXECUTED",
+        destination_library=str(tmp_path / "NAS" / "Movies"),
+        destination_directory=destination_dir, destination_filename=destination_filename,
+    )
+
+    replacement_media_file_id = _seed_media_file(connection, tmp_path, name="Alien-replacement.mkv")
+    replacement_candidate_id = _seed_candidate(connection, media_file_id=replacement_media_file_id)
+    _resolve_movie_identity(connection, media_file_id=replacement_media_file_id, candidate_id=replacement_candidate_id)
+
+    plan = generate_plan(connection, config, media_file_id=replacement_media_file_id, destination_category="movie")
+
+    assert plan.status == "READY_FOR_REVIEW"
+    assert plan.destination_directory == destination_dir
+    assert plan.destination_filename == destination_filename
+    assert plan.blocking_reasons == ()
+
+    approved = approve(connection, plan.id)
+    assert approved.status == "APPROVED"
+
+    result = audit_plan(connection, config, plan_id=plan.id)
+    assert result.readiness_status == ReadinessStatus.READY_FOR_EXECUTOR
+
+    historical_plan_row = connection.execute(
+        "SELECT status FROM ingest_plans WHERE id = ?", (historical_plan_id,)
+    ).fetchone()
+    assert historical_plan_row["status"] == "EXECUTED"
+    historical_media_row = connection.execute(
+        "SELECT state FROM media_files WHERE id = ?", (historical_media_file_id,)
+    ).fetchone()
+    assert historical_media_row["state"] == "MISSING"
+
+
 # --- determinism / regeneration ------------------------------------------------
 
 
